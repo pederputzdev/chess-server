@@ -1,0 +1,14 @@
+{
+  "name": "chess-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "chess.js": "^1.0.0",
+    "ws": "^8.15.1"
+  }
+}
