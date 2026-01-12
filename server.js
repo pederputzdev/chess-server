@@ -1,3 +1,6 @@
+// server.js (or index.js)
+// Node 18+ recommended (built-in fetch). If you're on Node <18, install node-fetch.
+
 import http from "http";
 import url from "url";
 import { WebSocketServer } from "ws";
@@ -5,18 +8,23 @@ import { Chess } from "chess.js";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const GAME_SERVER_API_KEY = process.env.GAME_SERVER_API_KEY;
+// --- ENV ---
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_ANON_KEY = (process.env.SUPABASE_ANON_KEY || "").trim();
+
+// IMPORTANT: trim removes invisible newline/space bugs that cause "Invalid server key"
+const GAME_SERVER_API_KEY = (process.env.GAME_SERVER_API_KEY || "").trim();
+
+// Always derive endpoint from SUPABASE_URL so you can't accidentally point at wrong project
 const GAME_SERVER_ENDPOINT =
-  process.env.GAME_SERVER_ENDPOINT ||
-  "https://qyagmgsltzmuscjlmypa.supabase.co/functions/v1/game-server";
+  (process.env.GAME_SERVER_ENDPOINT || "").trim() ||
+  `${SUPABASE_URL}/functions/v1/game-server`;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   throw new Error("Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars.");
 }
 if (!GAME_SERVER_API_KEY) {
-  throw new Error("Missing GAME_SERVER_API_KEY env var.");
+  throw new Error("Missing GAME_SERVER_API_KEY env var (or it is whitespace).");
 }
 
 // --- Simple helpers ---
@@ -51,7 +59,9 @@ function parseMove(input) {
     const t = to.trim().toLowerCase();
     if (!/^[a-h][1-8]$/.test(f) || !/^[a-h][1-8]$/.test(t)) return null;
     if (promotion && !/^[qrbn]$/.test(String(promotion).toLowerCase())) return null;
-    return promotion ? { from: f, to: t, promotion: String(promotion).toLowerCase() } : { from: f, to: t };
+    return promotion
+      ? { from: f, to: t, promotion: String(promotion).toLowerCase() }
+      : { from: f, to: t };
   }
 
   return null;
@@ -77,11 +87,28 @@ async function getUserIdFromToken(token) {
 
 // --- Call Lovable Edge Function (game-server) ---
 async function callGameServer(action, params = {}) {
+  // sanity log (never print key value)
+  console.log(
+    "[game-server] action=",
+    action,
+    "endpoint=",
+    GAME_SERVER_ENDPOINT,
+    "keyLen=",
+    GAME_SERVER_API_KEY.length
+  );
+
   const res = await fetch(GAME_SERVER_ENDPOINT, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${GAME_SERVER_API_KEY}`,
       "Content-Type": "application/json",
+
+      // Include apikey for Supabase gateway consistency
+      apikey: SUPABASE_ANON_KEY,
+
+      // Send multiple header variants to avoid mismatch with edge function implementation
+      Authorization: `Bearer ${GAME_SERVER_API_KEY}`,
+      "x-api-key": GAME_SERVER_API_KEY,
+      "x-game-server-key": GAME_SERVER_API_KEY,
     },
     body: JSON.stringify({ action, ...params }),
   });
@@ -95,9 +122,11 @@ async function callGameServer(action, params = {}) {
   }
 
   if (!res.ok) {
+    console.error("[game-server] FAIL", action, res.status, json);
     const msg = json?.error || json?.message || `Edge function error (${res.status})`;
     throw new Error(msg);
   }
+
   return json;
 }
 
@@ -160,7 +189,7 @@ async function tryMatchmake(wager) {
     return;
   }
 
-  // 2) Create game record in DB (this should lock wager server-side in your edge function logic)
+  // 2) Create game record in DB (edge function should lock wager there)
   let supabaseGameId;
   try {
     const created = await callGameServer("create_game", {
@@ -176,7 +205,7 @@ async function tryMatchmake(wager) {
     return;
   }
 
-  // 3) Fetch names (optional but useful)
+  // 3) Fetch names (optional)
   let aProfile = null;
   let bProfile = null;
   try {
@@ -240,7 +269,14 @@ async function endGame(localGameId, reason, winnerColor = null) {
   const game = games.get(localGameId);
   if (!game) return;
 
-  const payload = { type: "game_ended", reason, winnerColor, gameId: localGameId, dbGameId: game.supabaseGameId };
+  const payload = {
+    type: "game_ended",
+    reason,
+    winnerColor,
+    gameId: localGameId,
+    dbGameId: game.supabaseGameId,
+  };
+
   safeSend(game.whiteWs, payload);
   safeSend(game.blackWs, payload);
 
@@ -253,7 +289,7 @@ async function endGame(localGameId, reason, winnerColor = null) {
   try {
     await callGameServer("end_game", {
       game_id: game.supabaseGameId,
-      winner_id: winnerId, // if your edge function requires winner_id always, then draws must be handled there
+      winner_id: winnerId, // for draws, your edge function must handle winner_id null
       reason,
     });
   } catch (e) {
@@ -309,7 +345,11 @@ function handleMove(ws, data) {
 
   const moveObj = parseMove(data.move);
   if (!moveObj) {
-    safeSend(ws, { type: "error", code: "BAD_MOVE_FORMAT", message: "Move must be UCI like 'e2e4' or {from,to,promotion}." });
+    safeSend(ws, {
+      type: "error",
+      code: "BAD_MOVE_FORMAT",
+      message: "Move must be UCI like 'e2e4' or {from,to,promotion}.",
+    });
     return;
   }
 
@@ -426,7 +466,11 @@ wss.on("connection", async (ws, req) => {
   ws.inQueue = false;
   ws.wager = null;
 
-  safeSend(ws, { type: "welcome", message: "Authed. Send {type:'find_match', wager:<int>} to enter matchmaking.", userId });
+  safeSend(ws, {
+    type: "welcome",
+    message: "Authed. Send {type:'find_match', wager:<int>} to enter matchmaking.",
+    userId,
+  });
 
   ws.on("message", (raw) => {
     let data;
