@@ -1,5 +1,4 @@
-// server.js (or index.js)
-// Node 18+ recommended (built-in fetch). If you're on Node <18, install node-fetch.
+// server.js (Node 18+ required for global fetch)
 
 import http from "http";
 import url from "url";
@@ -11,11 +10,9 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 // --- ENV ---
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
 const SUPABASE_ANON_KEY = (process.env.SUPABASE_ANON_KEY || "").trim();
-
-// IMPORTANT: trim removes invisible newline/space bugs that cause "Invalid server key"
 const GAME_SERVER_API_KEY = (process.env.GAME_SERVER_API_KEY || "").trim();
 
-// Always derive endpoint from SUPABASE_URL so you can't accidentally point at wrong project
+// Derive endpoint from SUPABASE_URL by default
 const GAME_SERVER_ENDPOINT =
   (process.env.GAME_SERVER_ENDPOINT || "").trim() ||
   `${SUPABASE_URL}/functions/v1/game-server`;
@@ -27,9 +24,16 @@ if (!GAME_SERVER_API_KEY) {
   throw new Error("Missing GAME_SERVER_API_KEY env var (or it is whitespace).");
 }
 
-// --- Simple helpers ---
+// --- Helpers ---
 function safeSend(ws, obj) {
   if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+}
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(x) {
+  return typeof x === "string" && UUID_RE.test(x);
 }
 
 function parseWager(x) {
@@ -59,9 +63,7 @@ function parseMove(input) {
     const t = to.trim().toLowerCase();
     if (!/^[a-h][1-8]$/.test(f) || !/^[a-h][1-8]$/.test(t)) return null;
     if (promotion && !/^[qrbn]$/.test(String(promotion).toLowerCase())) return null;
-    return promotion
-      ? { from: f, to: t, promotion: String(promotion).toLowerCase() }
-      : { from: f, to: t };
+    return promotion ? { from: f, to: t, promotion: String(promotion).toLowerCase() } : { from: f, to: t };
   }
 
   return null;
@@ -70,47 +72,56 @@ function parseMove(input) {
 // --- Auth: verify Supabase access token -> user id ---
 async function getUserIdFromToken(token) {
   if (!token) return null;
+  // handle token potentially being an array/string
+  const t = Array.isArray(token) ? token[0] : token;
+  if (typeof t !== "string" || !t.trim()) return null;
 
   const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
     method: "GET",
     headers: {
       apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${t.trim()}`,
     },
   });
 
   if (!res.ok) return null;
-
   const user = await res.json();
-  return user?.id || null;
+  const id = user?.id || null;
+  return isUuid(id) ? id : null;
 }
 
-// --- Call Lovable Edge Function (game-server) ---
+// --- Call Supabase Edge Function (game-server) ---
 async function callGameServer(action, params = {}) {
-  // sanity log (never print key value)
-  console.log(
-    "[game-server] action=",
-    action,
-    "endpoint=",
-    GAME_SERVER_ENDPOINT,
-    "keyLen=",
-    GAME_SERVER_API_KEY.length
-  );
+  const bodyObj = { action, ...params };
+
+  // IMPORTANT: never let undefined leak in a way that becomes "undefined" in SQL
+  // JSON.stringify omits undefined keys; we also proactively remove them.
+  for (const k of Object.keys(bodyObj)) {
+    if (bodyObj[k] === undefined) delete bodyObj[k];
+  }
+
+  // tiny log (no secrets)
+  console.log("[game-server] ->", action, {
+    endpoint: GAME_SERVER_ENDPOINT,
+    keyLen: GAME_SERVER_API_KEY.length,
+    keys: Object.keys(bodyObj),
+  });
 
   const res = await fetch(GAME_SERVER_ENDPOINT, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
 
-      // Include apikey for Supabase gateway consistency
+      // not required for edge fn auth, but harmless and sometimes needed by gateway setups
       apikey: SUPABASE_ANON_KEY,
 
-      // Send multiple header variants to avoid mismatch with edge function implementation
+      // send multiple variants because your function checks several possibilities
       Authorization: `Bearer ${GAME_SERVER_API_KEY}`,
       "x-api-key": GAME_SERVER_API_KEY,
       "x-game-server-key": GAME_SERVER_API_KEY,
+      "x-server-key": GAME_SERVER_API_KEY,
     },
-    body: JSON.stringify({ action, ...params }),
+    body: JSON.stringify(bodyObj),
   });
 
   const text = await res.text();
@@ -122,7 +133,7 @@ async function callGameServer(action, params = {}) {
   }
 
   if (!res.ok) {
-    console.error("[game-server] FAIL", action, res.status, json);
+    console.error("[game-server] <- FAIL", action, res.status, json);
     const msg = json?.error || json?.message || `Edge function error (${res.status})`;
     throw new Error(msg);
   }
@@ -131,7 +142,7 @@ async function callGameServer(action, params = {}) {
 }
 
 // --- State ---
-// simple FIFO matchmaking by wager: Map<wager, WebSocket[]>
+// FIFO matchmaking by wager: Map<wager, WebSocket[]>
 const queues = new Map();
 
 // games: localId -> { chess, whiteWs, blackWs, supabaseGameId, wager, whiteId, blackId }
@@ -175,26 +186,38 @@ async function tryMatchmake(wager) {
     return;
   }
 
+  // Hard guard: never proceed without valid UUIDs
+  if (!isUuid(a.userId) || !isUuid(b.userId)) {
+    console.error("[matchmake] missing userId", { a: a.userId, b: b.userId });
+    safeSend(a, { type: "error", code: "BAD_AUTH_STATE", message: "Server missing your user id. Reconnect and try again." });
+    safeSend(b, { type: "error", code: "BAD_AUTH_STATE", message: "Server missing your user id. Reconnect and try again." });
+    return;
+  }
+
   // Not searching anymore
   a.inQueue = false;
   b.inQueue = false;
 
   // 1) Verify both can afford wager
   try {
-    await callGameServer("verify_wager", { player_id: a.userId, wager });
-    await callGameServer("verify_wager", { player_id: b.userId, wager });
+    // send BOTH user_id and player_id to match whichever the function reads
+    await callGameServer("verify_wager", { player_id: a.userId, user_id: a.userId, wager });
+    await callGameServer("verify_wager", { player_id: b.userId, user_id: b.userId, wager });
   } catch (e) {
     safeSend(a, { type: "error", code: "WAGER_DENIED", message: String(e.message || e) });
     safeSend(b, { type: "error", code: "WAGER_DENIED", message: String(e.message || e) });
     return;
   }
 
-  // 2) Create game record in DB (edge function should lock wager there)
+  // 2) Create game record in DB
   let supabaseGameId;
   try {
     const created = await callGameServer("create_game", {
       white_player_id: a.userId,
       black_player_id: b.userId,
+      // also include alt keys in case function expects different names
+      white_user_id: a.userId,
+      black_user_id: b.userId,
       wager,
     });
     supabaseGameId = created?.game_id || created?.id || created?.data?.id;
@@ -209,13 +232,13 @@ async function tryMatchmake(wager) {
   let aProfile = null;
   let bProfile = null;
   try {
-    aProfile = await callGameServer("get_player", { user_id: a.userId });
-    bProfile = await callGameServer("get_player", { user_id: b.userId });
+    aProfile = await callGameServer("get_player", { user_id: a.userId, player_id: a.userId });
+    bProfile = await callGameServer("get_player", { user_id: b.userId, player_id: b.userId });
   } catch {
     // non-fatal
   }
 
-  // 4) Create in-memory chess state + assign colors
+  // 4) In-memory game + colors
   const localGameId = `g_${Math.random().toString(36).slice(2, 10)}`;
   const chess = new Chess();
 
@@ -269,27 +292,17 @@ async function endGame(localGameId, reason, winnerColor = null) {
   const game = games.get(localGameId);
   if (!game) return;
 
-  const payload = {
-    type: "game_ended",
-    reason,
-    winnerColor,
-    gameId: localGameId,
-    dbGameId: game.supabaseGameId,
-  };
+  safeSend(game.whiteWs, { type: "game_ended", reason, winnerColor, gameId: localGameId, dbGameId: game.supabaseGameId });
+  safeSend(game.blackWs, { type: "game_ended", reason, winnerColor, gameId: localGameId, dbGameId: game.supabaseGameId });
 
-  safeSend(game.whiteWs, payload);
-  safeSend(game.blackWs, payload);
-
-  // Winner user id
   let winnerId = null;
   if (winnerColor === "w") winnerId = game.whiteId;
   if (winnerColor === "b") winnerId = game.blackId;
 
-  // finalize DB + payout via edge function
   try {
     await callGameServer("end_game", {
       game_id: game.supabaseGameId,
-      winner_id: winnerId, // for draws, your edge function must handle winner_id null
+      winner_id: winnerId, // allow null for draw if your function supports it
       reason,
     });
   } catch (e) {
@@ -297,7 +310,6 @@ async function endGame(localGameId, reason, winnerColor = null) {
     safeSend(game.blackWs, { type: "error", code: "END_GAME_FAILED", message: String(e.message || e) });
   }
 
-  // cleanup sockets
   if (game.whiteWs) {
     game.whiteWs.gameId = null;
     game.whiteWs.color = null;
@@ -311,7 +323,6 @@ async function endGame(localGameId, reason, winnerColor = null) {
 }
 
 async function updateGameState(game) {
-  // Optional: keep DB updated for reconnect / history
   try {
     await callGameServer("update_game_state", {
       game_id: game.supabaseGameId,
@@ -345,11 +356,7 @@ function handleMove(ws, data) {
 
   const moveObj = parseMove(data.move);
   if (!moveObj) {
-    safeSend(ws, {
-      type: "error",
-      code: "BAD_MOVE_FORMAT",
-      message: "Move must be UCI like 'e2e4' or {from,to,promotion}.",
-    });
+    safeSend(ws, { type: "error", code: "BAD_MOVE_FORMAT", message: "Move must be UCI like 'e2e4' or {from,to,promotion}." });
     return;
   }
 
@@ -371,7 +378,6 @@ function handleMove(ws, data) {
   safeSend(game.whiteWs, broadcast);
   safeSend(game.blackWs, broadcast);
 
-  // async DB update (don’t block moves)
   updateGameState(game);
 
   if (chess.isGameOver()) {
@@ -412,16 +418,13 @@ const server = http.createServer((req, res) => {
 // --- WebSocket server mounted at /ws ---
 const wss = new WebSocketServer({ noServer: true });
 
-// Upgrade HTTP -> WS only for /ws (allow query params)
 server.on("upgrade", (req, socket, head) => {
   const parsed = url.parse(req.url, true);
   if (parsed.pathname !== "/ws") {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
 // Keepalive
@@ -449,7 +452,6 @@ wss.on("connection", async (ws, req) => {
   ws.isAlive = true;
   ws.on("pong", heartbeat);
 
-  // Parse token from ?token=
   const parsed = url.parse(req.url, true);
   const token = parsed.query?.token;
 
@@ -487,6 +489,11 @@ wss.on("connection", async (ws, req) => {
     }
 
     if (data.type === "find_match") {
+      if (!isUuid(ws.userId)) {
+        safeSend(ws, { type: "error", code: "BAD_AUTH_STATE", message: "Server missing your user id. Reconnect and try again." });
+        return;
+      }
+
       if (ws.gameId) {
         safeSend(ws, { type: "error", code: "ALREADY_IN_GAME", message: "You are already in a game." });
         return;
@@ -536,7 +543,6 @@ wss.on("connection", async (ws, req) => {
   ws.on("close", () => {
     if (ws.inQueue) removeFromQueue(ws);
 
-    // Disconnect = opponent wins
     if (ws.gameId) {
       const game = games.get(ws.gameId);
       if (game) {
