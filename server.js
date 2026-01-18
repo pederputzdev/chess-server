@@ -237,11 +237,19 @@ async function tryMatchmake(wager) {
   try {
     const lockResult = await callGameServer("lock_wager", { game_id: supabaseGameId });
     if (!lockResult?.success) {
-      throw new Error(lockResult?.error || "Failed to lock wager");
+      const errorMsg = lockResult?.details || lockResult?.error || "Failed to lock wager";
+      console.error("lock_wager failed:", { lockResult, supabaseGameId });
+      throw new Error(errorMsg);
     }
   } catch (e) {
-    safeSend(a, { type: "error", code: "WAGER_LOCK_FAILED", message: String(e.message || e) });
-    safeSend(b, { type: "error", code: "WAGER_LOCK_FAILED", message: String(e.message || e) });
+    const errorMsg = e.payload?.details || e.payload?.error || e.message || String(e);
+    console.error("lock_wager exception:", { 
+      message: e.message, 
+      payload: e.payload, 
+      supabaseGameId 
+    });
+    safeSend(a, { type: "error", code: "WAGER_LOCK_FAILED", message: errorMsg });
+    safeSend(b, { type: "error", code: "WAGER_LOCK_FAILED", message: errorMsg });
     return;
   }
 
