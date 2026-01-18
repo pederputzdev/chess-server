@@ -233,6 +233,18 @@ async function tryMatchmake(wager) {
     return;
   }
 
+  // 2.5) Lock wager (deduct from both players' profiles.skilled_coins)
+  try {
+    const lockResult = await callGameServer("lock_wager", { game_id: supabaseGameId });
+    if (!lockResult?.success) {
+      throw new Error(lockResult?.error || "Failed to lock wager");
+    }
+  } catch (e) {
+    safeSend(a, { type: "error", code: "WAGER_LOCK_FAILED", message: String(e.message || e) });
+    safeSend(b, { type: "error", code: "WAGER_LOCK_FAILED", message: String(e.message || e) });
+    return;
+  }
+
   // 3) Fetch names (optional)
   let aProfile = null;
   let bProfile = null;
