@@ -25,6 +25,29 @@ if (!GAME_SERVER_API_KEY) {
   throw new Error("Missing GAME_SERVER_API_KEY env var (or it is whitespace).");
 }
 
+// --- Process-level error handlers (prevent silent crashes) ---
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[Server] Unhandled Promise Rejection", {
+    reason: reason instanceof Error ? reason.message : String(reason),
+    stack: reason instanceof Error ? reason.stack : undefined,
+    code: reason instanceof Error ? reason.code : undefined,
+    timestamp: new Date().toISOString(),
+  });
+  // Don't crash - log and continue
+  // In production, you might want to gracefully shutdown here
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[Server] Uncaught Exception", {
+    error: error.message,
+    stack: error.stack,
+    code: error.code,
+    timestamp: new Date().toISOString(),
+  });
+  // Log but don't crash immediately - allow graceful shutdown
+  // In production, you might want to exit(1) after logging
+});
+
 // --- Simple helpers ---
 function safeSend(ws, obj) {
   if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
@@ -69,18 +92,90 @@ function parseMove(input) {
 async function getUserIdFromToken(token) {
   if (!token) return null;
 
-  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-    method: "GET",
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${token}`,
-    },
-  });
+  const AUTH_TIMEOUT_MS = 5000; // 5 second timeout
+  const MAX_RETRIES = 2;
+  const RETRY_DELAYS = [100, 200]; // Exponential backoff in ms
 
-  if (!res.ok) return null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      // Create AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), AUTH_TIMEOUT_MS);
 
-  const user = await res.json();
-  return user?.id || null;
+      try {
+        const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+          method: "GET",
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${token}`,
+          },
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!res.ok) {
+          // Non-200 response - don't retry, just return null
+          console.log("[Auth] token verification failed", {
+            reason: "http_error",
+            code: res.status,
+            message: `HTTP ${res.status}`,
+            attempt: attempt + 1,
+          });
+          return null;
+        }
+
+        const user = await res.json();
+        return user?.id || null;
+      } catch (fetchError) {
+        clearTimeout(timeoutId);
+        throw fetchError; // Re-throw to outer catch
+      }
+    } catch (error) {
+      const errorCode = error.code || error.name || "UNKNOWN";
+      const errorMessage = error.message || String(error);
+      
+      // Check if this is a network error that we should retry
+      const isNetworkError = 
+        errorCode === "ECONNRESET" ||
+        errorCode === "ETIMEDOUT" ||
+        errorCode === "ENOTFOUND" ||
+        errorCode === "ECONNREFUSED" ||
+        errorCode === "AbortError" ||
+        error.message?.includes("fetch failed") ||
+        error.message?.includes("network");
+
+      if (isNetworkError && attempt < MAX_RETRIES) {
+        // Retry with exponential backoff
+        const delay = RETRY_DELAYS[attempt] || 200;
+        console.log("[Auth] token verification retry", {
+          reason: "network_error",
+          code: errorCode,
+          message: errorMessage,
+          attempt: attempt + 1,
+          maxAttempts: MAX_RETRIES + 1,
+          retryDelay: delay,
+        });
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue; // Retry
+      }
+
+      // Final attempt failed or non-retryable error
+      console.log("[Auth] token verification failed", {
+        reason: isNetworkError ? "network_error_final" : "error",
+        code: errorCode,
+        message: errorMessage,
+        attempt: attempt + 1,
+        willRetry: isNetworkError && attempt < MAX_RETRIES,
+      });
+      
+      // Return null instead of throwing - never crash the server
+      return null;
+    }
+  }
+
+  // Should never reach here, but safety fallback
+  return null;
 }
 
 // --- Normalize player identifier fields for edge function compatibility ---
@@ -288,6 +383,10 @@ async function tryMatchmake(wager) {
     blackTimeMs: 60000,  // 60 seconds in milliseconds
     lastTickServerTimeMs: nowMs,  // Server timestamp when clocks were last updated
     isEnded: false,  // Track if game has ended (for idempotent operations)
+    // Disconnect grace period state
+    disconnectedAt: null,  // Timestamp when player disconnected (null if both connected)
+    disconnectedPlayer: null,  // 'w' or 'b' if a player is disconnected, null if both connected
+    disconnectTimer: null,  // setTimeout handle for grace period timer
   });
 
   // Get the game object to access timer state
@@ -333,6 +432,12 @@ async function tryMatchmake(wager) {
 async function endGame(localGameId, reason, winnerColor = null) {
   const game = games.get(localGameId);
   if (!game) return;
+  
+  // Clear any disconnect timer if game is ending
+  if (game.disconnectTimer) {
+    clearTimeout(game.disconnectTimer);
+    game.disconnectTimer = null;
+  }
   
   // Mark game as ended to prevent duplicate processing
   if (game.isEnded) {
@@ -608,176 +713,413 @@ wss.on("close", () => clearInterval(interval));
 
 // --- WS connections ---
 wss.on("connection", async (ws, req) => {
-  ws.isAlive = true;
-  ws.on("pong", heartbeat);
+  // Wrap entire connection handler in try/catch to prevent crashes
+  try {
+    ws.isAlive = true;
+    ws.on("pong", heartbeat);
 
-  const parsed = url.parse(req.url, true);
+    const parsed = url.parse(req.url, true);
 
-  // token can be string | string[] | undefined
-  const tokenRaw = parsed.query?.token;
-  const token = Array.isArray(tokenRaw) ? tokenRaw[0] : tokenRaw;
+    // token can be string | string[] | undefined
+    const tokenRaw = parsed.query?.token;
+    const token = Array.isArray(tokenRaw) ? tokenRaw[0] : tokenRaw;
 
-  const userId = await getUserIdFromToken(token);
-  if (!userId) {
-    safeSend(ws, { type: "error", code: "UNAUTHORIZED", message: "Missing/invalid token." });
-    ws.close();
-    return;
-  }
-
-  ws.userId = userId;
-  ws.gameId = null;
-  ws.color = null;
-  ws.inQueue = false;
-  ws.wager = null;
-
-  safeSend(ws, {
-    type: "welcome",
-    message: "Authed. Send {type:'find_match', wager:<int>} to enter matchmaking.",
-    userId,
-  });
-
-  ws.on("message", (raw) => {
-    let data;
+    let userId;
     try {
-      data = JSON.parse(raw.toString());
-    } catch {
-      safeSend(ws, { type: "error", code: "BAD_JSON", message: "Invalid JSON." });
-      return;
-    }
-
-    if (!data || typeof data.type !== "string") {
-      safeSend(ws, { type: "error", code: "MISSING_TYPE", message: "Message must include a string 'type'." });
-      return;
-    }
-
-    if (data.type === "find_match") {
-      if (ws.gameId) {
-        safeSend(ws, { type: "error", code: "ALREADY_IN_GAME", message: "You are already in a game." });
-        return;
-      }
-      if (ws.inQueue) {
-        safeSend(ws, { type: "status", message: "Already searching..." });
-        return;
-      }
-
-      const wager = parseWager(data.wager);
-      if (!wager) {
-        safeSend(ws, { type: "error", code: "BAD_WAGER", message: "Provide wager as a positive integer." });
-        return;
-      }
-
-      enqueue(ws, wager);
-      safeSend(ws, { type: "searching", message: "Searching for opponent...", wager });
-      tryMatchmake(wager);
-      return;
-    }
-
-    if (data.type === "cancel_search") {
-      if (ws.inQueue) {
-        removeFromQueue(ws);
-        safeSend(ws, { type: "search_cancelled" });
-      }
-      return;
-    }
-
-    if (data.type === "move") {
-      handleMove(ws, data);
-      return;
-    }
-
-    if (data.type === "sync_game") {
-      if (!ws.gameId) {
-        safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not in a game." });
-        return;
-      }
-      const game = games.get(ws.gameId);
-      if (!game) {
-        safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found." });
-        return;
-      }
-      
-      // Calculate current clocks from server time
-      const clocks = calculateCurrentClocks(game);
-      
-      // Send game sync response
-      safeSend(ws, {
-        type: "game_sync",
-        gameId: ws.gameId,
-        dbGameId: game.supabaseGameId,
-        fen: game.chess.fen(),
-        turn: game.chess.turn(),
-        whiteTime: clocks.whiteTime,
-        blackTime: clocks.blackTime,
-        serverTimeMs: clocks.serverTimeMs,
-        status: game.isEnded ? "ended" : "active",
-        wager: game.wager,
+      userId = await getUserIdFromToken(token);
+    } catch (authError) {
+      // Auth function should never throw, but catch just in case
+      console.error("[Server] Unexpected error in getUserIdFromToken:", {
+        error: authError.message,
+        code: authError.code,
+        stack: authError.stack,
       });
-      return;
+      userId = null;
     }
 
-    if (data.type === "resign") {
-      if (!ws.gameId) {
-        console.log("[Server] RESIGN received - NOT_IN_GAME", { userId: ws.userId, wsReadyState: ws.readyState });
-        safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not in a game." });
-        return;
-      }
-      const game = games.get(ws.gameId);
-      if (!game) {
-        console.log("[Server] RESIGN received - GAME_NOT_FOUND", { gameId: ws.gameId, userId: ws.userId });
-        safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found." });
-        return;
-      }
+    if (!userId) {
+      // Auth failed - send error and close gracefully
+      const errorCode = token ? "AUTH_UNAVAILABLE" : "UNAUTHORIZED";
+      const errorMessage = token 
+        ? "Could not authenticate. Please retry." 
+        : "Missing/invalid token.";
       
-      console.log("[Server] RESIGN received", {
-        gameId: ws.gameId,
-        dbGameId: game.supabaseGameId,
-        resigningPlayerId: ws.userId,
-        resigningPlayerColor: ws.color,
-        gameIsEnded: game.isEnded,
+      console.log("[Server] Connection rejected - auth failed", {
+        errorCode,
+        hasToken: !!token,
         timestamp: new Date().toISOString(),
       });
       
-      // Idempotent: if game already ended, send current ended state
-      if (game.isEnded) {
-        console.log("[Server] RESIGN - game already ended, sending current state", {
-          gameId: ws.gameId,
-          lastEndReason: game.lastEndReason,
-          lastWinnerColor: game.lastWinnerColor,
-        });
-        safeSend(ws, {
-          type: "game_ended",
-          reason: game.lastEndReason || "resign",
-          winnerColor: game.lastWinnerColor,
-          gameId: ws.gameId,
-          dbGameId: game.supabaseGameId,
-        });
-        return;
-      }
-      
-      const winnerColor = ws.color === "w" ? "b" : "w";
-      console.log("[Server] RESIGN applied - calling endGame", {
-        gameId: ws.gameId,
-        dbGameId: game.supabaseGameId,
-        resigningPlayerColor: ws.color,
-        winnerColor,
-        reason: "resign",
+      safeSend(ws, { 
+        type: "error", 
+        code: errorCode, 
+        message: errorMessage 
       });
-      endGame(ws.gameId, "resign", winnerColor);
+      ws.close(4001, errorMessage); // 4001 = Going Away (auth failed)
       return;
     }
 
-    safeSend(ws, { type: "error", code: "UNKNOWN_TYPE", message: `Unknown type '${data.type}'.` });
+    ws.userId = userId;
+    ws.gameId = null;
+    ws.color = null;
+    ws.inQueue = false;
+    ws.wager = null;
+
+    // Check if user has an active game they can reconnect to
+    let reconnectedGame = null;
+    for (const [gameId, game] of games.entries()) {
+      if (game.isEnded) continue;
+      
+      // Check if this user is a player in this game
+      const isWhite = game.whiteId === userId;
+      const isBlack = game.blackId === userId;
+      
+      if (isWhite || isBlack) {
+        const playerColor = isWhite ? "w" : "b";
+        
+        // Check if this player was disconnected and is within grace period
+        if (game.disconnectedPlayer === playerColor && game.disconnectedAt) {
+          const timeSinceDisconnect = Date.now() - game.disconnectedAt;
+          const GRACE_PERIOD_MS = 30000;
+          
+          if (timeSinceDisconnect < GRACE_PERIOD_MS) {
+            // Player reconnected within grace period - restore game state
+            console.log("[Server] Player reconnected to existing game", {
+              gameId,
+              userId,
+              playerColor,
+              timeSinceDisconnect,
+              timestamp: new Date().toISOString(),
+            });
+            
+            // Restore WebSocket reference
+            if (playerColor === "w") {
+              game.whiteWs = ws;
+            } else {
+              game.blackWs = ws;
+            }
+            
+            // Clear disconnect state
+            if (game.disconnectTimer) {
+              clearTimeout(game.disconnectTimer);
+              game.disconnectTimer = null;
+            }
+            game.disconnectedAt = null;
+            game.disconnectedPlayer = null;
+            
+            // Set WebSocket game state
+            ws.gameId = gameId;
+            ws.color = playerColor;
+            
+            // Notify opponent that player reconnected
+            const opponentWs = playerColor === "w" ? game.blackWs : game.whiteWs;
+            if (opponentWs && opponentWs.readyState === opponentWs.OPEN) {
+              safeSend(opponentWs, {
+                type: "opponent_reconnected",
+                message: "Opponent reconnected.",
+              });
+            }
+            
+            // Send game sync to reconnected player
+            const clocks = calculateCurrentClocks(game);
+            safeSend(ws, {
+              type: "game_reconnected",
+              message: "Reconnected to your game.",
+              gameId,
+              dbGameId: game.supabaseGameId,
+              fen: game.chess.fen(),
+              turn: game.chess.turn(),
+              whiteTime: clocks.whiteTime,
+              blackTime: clocks.blackTime,
+              serverTimeMs: clocks.serverTimeMs,
+              status: "active",
+              wager: game.wager,
+              color: playerColor,
+            });
+            
+            reconnectedGame = game;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!reconnectedGame) {
+      // Normal new connection - send welcome
+      safeSend(ws, {
+        type: "welcome",
+        message: "Authed. Send {type:'find_match', wager:<int>} to enter matchmaking.",
+        userId,
+      });
+    }
+
+  ws.on("message", (raw) => {
+    // Wrap entire message handler in try/catch to prevent crashes
+    try {
+      let data;
+      try {
+        data = JSON.parse(raw.toString());
+      } catch {
+        safeSend(ws, { type: "error", code: "BAD_JSON", message: "Invalid JSON." });
+        return;
+      }
+
+      if (!data || typeof data.type !== "string") {
+        safeSend(ws, { type: "error", code: "MISSING_TYPE", message: "Message must include a string 'type'." });
+        return;
+      }
+
+      // Handle each message type with individual try/catch for granular error handling
+      try {
+            if (data.type === "find_match") {
+          if (ws.gameId) {
+            safeSend(ws, { type: "error", code: "ALREADY_IN_GAME", message: "You are already in a game." });
+            return;
+          }
+          if (ws.inQueue) {
+            safeSend(ws, { type: "status", message: "Already searching..." });
+            return;
+          }
+
+          const wager = parseWager(data.wager);
+          if (!wager) {
+            safeSend(ws, { type: "error", code: "BAD_WAGER", message: "Provide wager as a positive integer." });
+            return;
+          }
+
+          enqueue(ws, wager);
+          safeSend(ws, { type: "searching", message: "Searching for opponent...", wager });
+          tryMatchmake(wager);
+          return;
+        }
+
+        if (data.type === "cancel_search") {
+          if (ws.inQueue) {
+            removeFromQueue(ws);
+            safeSend(ws, { type: "search_cancelled" });
+          }
+          return;
+        }
+
+        if (data.type === "move") {
+          handleMove(ws, data);
+          return;
+        }
+
+        if (data.type === "sync_game") {
+          if (!ws.gameId) {
+            safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not in a game." });
+            return;
+          }
+          const game = games.get(ws.gameId);
+          if (!game) {
+            safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found." });
+            return;
+          }
+          
+          // Calculate current clocks from server time
+          const clocks = calculateCurrentClocks(game);
+          
+          // Send game sync response
+          safeSend(ws, {
+            type: "game_sync",
+            gameId: ws.gameId,
+            dbGameId: game.supabaseGameId,
+            fen: game.chess.fen(),
+            turn: game.chess.turn(),
+            whiteTime: clocks.whiteTime,
+            blackTime: clocks.blackTime,
+            serverTimeMs: clocks.serverTimeMs,
+            status: game.isEnded ? "ended" : "active",
+            wager: game.wager,
+          });
+          return;
+        }
+
+        if (data.type === "resign") {
+          if (!ws.gameId) {
+            console.log("[Server] RESIGN received - NOT_IN_GAME", { userId: ws.userId, wsReadyState: ws.readyState });
+            safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not in a game." });
+            return;
+          }
+          const game = games.get(ws.gameId);
+          if (!game) {
+            console.log("[Server] RESIGN received - GAME_NOT_FOUND", { gameId: ws.gameId, userId: ws.userId });
+            safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found." });
+            return;
+          }
+          
+          console.log("[Server] RESIGN received", {
+            gameId: ws.gameId,
+            dbGameId: game.supabaseGameId,
+            resigningPlayerId: ws.userId,
+            resigningPlayerColor: ws.color,
+            gameIsEnded: game.isEnded,
+            timestamp: new Date().toISOString(),
+          });
+          
+          // Idempotent: if game already ended, send current ended state
+          if (game.isEnded) {
+            console.log("[Server] RESIGN - game already ended, sending current state", {
+              gameId: ws.gameId,
+              lastEndReason: game.lastEndReason,
+              lastWinnerColor: game.lastWinnerColor,
+            });
+            safeSend(ws, {
+              type: "game_ended",
+              reason: game.lastEndReason || "resign",
+              winnerColor: game.lastWinnerColor,
+              gameId: ws.gameId,
+              dbGameId: game.supabaseGameId,
+            });
+            return;
+          }
+          
+          const winnerColor = ws.color === "w" ? "b" : "w";
+          console.log("[Server] RESIGN applied - calling endGame", {
+            gameId: ws.gameId,
+            dbGameId: game.supabaseGameId,
+            resigningPlayerColor: ws.color,
+            winnerColor,
+            reason: "resign",
+          });
+          endGame(ws.gameId, "resign", winnerColor);
+          return;
+        }
+
+        safeSend(ws, { type: "error", code: "UNKNOWN_TYPE", message: `Unknown type '${data.type}'.` });
+      } catch (messageError) {
+        // Error handling for individual message type
+        console.error("[Server] Error handling message", {
+          error: messageError.message,
+          code: messageError.code,
+          stack: messageError.stack,
+          messageType: data?.type || "unknown",
+          gameId: ws.gameId || "none",
+          userId: ws.userId || "unknown",
+          timestamp: new Date().toISOString(),
+        });
+        
+        // Send error to client but don't crash
+        safeSend(ws, {
+          type: "error",
+          code: "SERVER_ERROR",
+          message: "Something went wrong processing your message. Please try again.",
+        });
+        // Do NOT end game for opponent, do NOT crash
+      }
+    } catch (outerError) {
+      // Catch any errors in message parsing or outer handler
+      console.error("[Server] Unhandled error in message handler", {
+        error: outerError.message,
+        code: outerError.code,
+        stack: outerError.stack,
+        userId: ws.userId || "unknown",
+        timestamp: new Date().toISOString(),
+      });
+      
+      // Send error to client
+      safeSend(ws, {
+        type: "error",
+        code: "SERVER_ERROR",
+        message: "An error occurred. Please reconnect.",
+      });
+      // Do NOT crash, do NOT end game
+    }
   });
 
   ws.on("close", () => {
     if (ws.inQueue) removeFromQueue(ws);
 
-    // Disconnect = opponent wins
+    // Handle disconnect with grace period (30 seconds)
     if (ws.gameId) {
       const game = games.get(ws.gameId);
-      if (game) {
-        const winnerColor = ws.color === "w" ? "b" : "w";
-        endGame(ws.gameId, "disconnect", winnerColor);
+      if (game && !game.isEnded) {
+        const disconnectedColor = ws.color;
+        const disconnectedUserId = ws.userId;
+        
+        console.log("[Server] Player disconnected", {
+          gameId: ws.gameId,
+          disconnectedPlayerColor: disconnectedColor,
+          disconnectedPlayerId: disconnectedUserId,
+          timestamp: new Date().toISOString(),
+        });
+        
+        // Clear any existing disconnect timer
+        if (game.disconnectTimer) {
+          clearTimeout(game.disconnectTimer);
+          game.disconnectTimer = null;
+        }
+        
+        // Mark player as disconnected
+        game.disconnectedAt = Date.now();
+        game.disconnectedPlayer = disconnectedColor;
+        
+        // Clear the WebSocket reference for the disconnected player
+        if (disconnectedColor === "w") {
+          game.whiteWs = null;
+        } else {
+          game.blackWs = null;
+        }
+        
+        // Notify opponent that player disconnected (but game not ended yet)
+        const opponentWs = disconnectedColor === "w" ? game.blackWs : game.whiteWs;
+        if (opponentWs && opponentWs.readyState === opponentWs.OPEN) {
+          safeSend(opponentWs, {
+            type: "opponent_disconnected",
+            message: "Opponent disconnected. Waiting for reconnection...",
+            gracePeriodSeconds: 30,
+          });
+        }
+        
+        // Set grace period timer (30 seconds)
+        const GRACE_PERIOD_MS = 30000; // 30 seconds
+        const gameIdForTimer = ws.gameId;
+        game.disconnectTimer = setTimeout(() => {
+          // Check if player reconnected
+          const currentGame = games.get(gameIdForTimer);
+          if (!currentGame || currentGame.isEnded) {
+            return; // Game already ended or doesn't exist
+          }
+          
+          // Check if the disconnected player reconnected
+          const disconnectedWs = disconnectedColor === "w" ? currentGame.whiteWs : currentGame.blackWs;
+          const isReconnected = disconnectedWs && 
+                                disconnectedWs.readyState === disconnectedWs.OPEN &&
+                                disconnectedWs.userId === disconnectedUserId;
+          
+          if (!isReconnected) {
+            // Player did not reconnect within grace period - end game
+            console.log("[Server] Disconnect grace period expired - ending game", {
+              gameId: gameIdForTimer,
+              disconnectedPlayerColor: disconnectedColor,
+              timestamp: new Date().toISOString(),
+            });
+            
+            const winnerColor = disconnectedColor === "w" ? "b" : "w";
+            endGame(gameIdForTimer, "disconnect_timeout", winnerColor);
+          } else {
+            // Player reconnected - clear disconnect state
+            console.log("[Server] Player reconnected within grace period", {
+              gameId: gameIdForTimer,
+              reconnectedPlayerColor: disconnectedColor,
+              timestamp: new Date().toISOString(),
+            });
+            
+            currentGame.disconnectedAt = null;
+            currentGame.disconnectedPlayer = null;
+            currentGame.disconnectTimer = null;
+            
+            // Notify opponent that player reconnected
+            const opponentWs = disconnectedColor === "w" ? currentGame.blackWs : currentGame.whiteWs;
+            if (opponentWs && opponentWs.readyState === opponentWs.OPEN) {
+              safeSend(opponentWs, {
+                type: "opponent_reconnected",
+                message: "Opponent reconnected.",
+              });
+            }
+          }
+        }, GRACE_PERIOD_MS);
       }
     }
   });
