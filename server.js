@@ -337,21 +337,27 @@ async function endGame(localGameId, reason, winnerColor = null) {
   // Mark game as ended to prevent duplicate processing
   if (game.isEnded) {
     // Game already ended - send current state (idempotent)
-    const clocks = calculateCurrentClocks(game);
-    safeSend(game.whiteWs, {
+    console.log("[Server] endGame called but game already ended (idempotent)", {
+      gameId: localGameId,
+      dbGameId: game.supabaseGameId,
+      lastEndReason: game.lastEndReason,
+      lastWinnerColor: game.lastWinnerColor,
+      newReason: reason,
+      newWinnerColor: winnerColor,
+    });
+    const idempotentPayload = {
       type: "game_ended",
       reason: game.lastEndReason || reason,
       winnerColor: game.lastWinnerColor || winnerColor,
+      gameId: localGameId,  // Always include gameId
+      dbGameId: game.supabaseGameId,  // Always include dbGameId
+    };
+    console.log("[Server] Sending idempotent game_ended to both players", {
       gameId: localGameId,
-      dbGameId: game.supabaseGameId,
+      payload: idempotentPayload,
     });
-    safeSend(game.blackWs, {
-      type: "game_ended",
-      reason: game.lastEndReason || reason,
-      winnerColor: game.lastWinnerColor || winnerColor,
-      gameId: localGameId,
-      dbGameId: game.supabaseGameId,
-    });
+    safeSend(game.whiteWs, idempotentPayload);
+    safeSend(game.blackWs, idempotentPayload);
     return;
   }
   
@@ -363,9 +369,20 @@ async function endGame(localGameId, reason, winnerColor = null) {
     type: "game_ended",
     reason,
     winnerColor,
+    gameId: localGameId,  // Always include gameId
+    dbGameId: game.supabaseGameId,  // Always include dbGameId
+  };
+
+  console.log("[Server] Sending game_ended to both players", {
     gameId: localGameId,
     dbGameId: game.supabaseGameId,
-  };
+    reason,
+    winnerColor,
+    whitePlayerId: game.whiteId,
+    blackPlayerId: game.blackId,
+    payload,
+    timestamp: new Date().toISOString(),
+  });
 
   safeSend(game.whiteWs, payload);
   safeSend(game.blackWs, payload);
@@ -700,18 +717,33 @@ wss.on("connection", async (ws, req) => {
 
     if (data.type === "resign") {
       if (!ws.gameId) {
+        console.log("[Server] RESIGN received - NOT_IN_GAME", { userId: ws.userId, wsReadyState: ws.readyState });
         safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not in a game." });
         return;
       }
       const game = games.get(ws.gameId);
       if (!game) {
+        console.log("[Server] RESIGN received - GAME_NOT_FOUND", { gameId: ws.gameId, userId: ws.userId });
         safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found." });
         return;
       }
       
+      console.log("[Server] RESIGN received", {
+        gameId: ws.gameId,
+        dbGameId: game.supabaseGameId,
+        resigningPlayerId: ws.userId,
+        resigningPlayerColor: ws.color,
+        gameIsEnded: game.isEnded,
+        timestamp: new Date().toISOString(),
+      });
+      
       // Idempotent: if game already ended, send current ended state
       if (game.isEnded) {
-        const clocks = calculateCurrentClocks(game);
+        console.log("[Server] RESIGN - game already ended, sending current state", {
+          gameId: ws.gameId,
+          lastEndReason: game.lastEndReason,
+          lastWinnerColor: game.lastWinnerColor,
+        });
         safeSend(ws, {
           type: "game_ended",
           reason: game.lastEndReason || "resign",
@@ -723,6 +755,13 @@ wss.on("connection", async (ws, req) => {
       }
       
       const winnerColor = ws.color === "w" ? "b" : "w";
+      console.log("[Server] RESIGN applied - calling endGame", {
+        gameId: ws.gameId,
+        dbGameId: game.supabaseGameId,
+        resigningPlayerColor: ws.color,
+        winnerColor,
+        reason: "resign",
+      });
       endGame(ws.gameId, "resign", winnerColor);
       return;
     }
