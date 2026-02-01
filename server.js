@@ -1123,6 +1123,30 @@ wss.on("connection", async (ws, req) => {
       }
     }
   });
+  
+  } catch (error) {
+    // Catch any unhandled errors in connection handler
+    console.error("[Server] Unhandled error in connection handler:", {
+      error: error.message,
+      code: error.code,
+      stack: error.stack,
+      userId: ws.userId || "unknown",
+      timestamp: new Date().toISOString(),
+    });
+    
+    // Send error to client if socket is still open
+    try {
+      safeSend(ws, {
+        type: "error",
+        code: "SERVER_ERROR",
+        message: "Connection error occurred. Please reconnect.",
+      });
+      ws.close(1011, "Internal server error"); // 1011 = Internal Error
+    } catch (closeError) {
+      // Socket might already be closed, ignore
+      console.log("[Server] Could not send error to client (socket closed)");
+    }
+  }
 });
 
 // Periodic clock updates and time loss detection (every 1.5 seconds)
