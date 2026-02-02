@@ -383,6 +383,7 @@ async function tryMatchmake(wager) {
     blackTimeMs: 60000,  // 60 seconds in milliseconds
     lastTickServerTimeMs: nowMs,  // Server timestamp when clocks were last updated
     isEnded: false,  // Track if game has ended (for idempotent operations)
+    createdAt: nowMs,  // Track when game was created (for match establishment grace period)
     // Disconnect grace period state
     disconnectedAt: null,  // Timestamp when player disconnected (null if both connected)
     disconnectedPlayer: null,  // 'w' or 'b' if a player is disconnected, null if both connected
@@ -424,6 +425,35 @@ async function tryMatchmake(wager) {
       name: aProfile?.name || aProfile?.username || aProfile?.display_name || null,
     },
   });
+
+  // Add connection stability check after 2 seconds
+  setTimeout(() => {
+    const game = games.get(localGameId);
+    if (!game || game.isEnded) return;
+    
+    const whiteOpen = game.whiteWs && game.whiteWs.readyState === game.whiteWs.OPEN;
+    const blackOpen = game.blackWs && game.blackWs.readyState === game.blackWs.OPEN;
+    
+    if (!whiteOpen && !blackOpen) {
+      // Both disconnected immediately - likely network issue, not a real disconnect
+      console.log("[Server] Both players disconnected immediately after match - likely network issue", {
+        gameId: localGameId,
+        timestamp: new Date().toISOString(),
+      });
+      // Don't end game - let them reconnect via existing reconnection logic
+      return;
+    }
+    
+    if (!whiteOpen || !blackOpen) {
+      const disconnectedColor = !whiteOpen ? "w" : "b";
+      // Only log - don't start timer here, let the close handler manage it
+      console.log("[Server] One player connection unstable after match", {
+        gameId: localGameId,
+        disconnectedColor,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }, 2000);
 
   if (q.length === 0) queues.delete(wager);
   else queues.set(wager, q);
@@ -1037,14 +1067,127 @@ wss.on("connection", async (ws, req) => {
       if (game && !game.isEnded) {
         const disconnectedColor = ws.color;
         const disconnectedUserId = ws.userId;
+        const gameAge = Date.now() - game.createdAt;
+        const MATCH_ESTABLISHMENT_GRACE_MS = 5000; // 5 seconds
         
         console.log("[Server] Player disconnected", {
           gameId: ws.gameId,
           disconnectedPlayerColor: disconnectedColor,
           disconnectedPlayerId: disconnectedUserId,
+          gameAge: gameAge,
+          isDuringEstablishment: gameAge < MATCH_ESTABLISHMENT_GRACE_MS,
           timestamp: new Date().toISOString(),
         });
         
+        // If game was just created, don't start disconnect timer immediately
+        // This handles cases where connection closes before match_found is received
+        if (gameAge < MATCH_ESTABLISHMENT_GRACE_MS) {
+          console.log("[Server] Player disconnected during match establishment - waiting before starting timer", {
+            gameId: ws.gameId,
+            gameAge,
+            disconnectedPlayerColor: disconnectedColor,
+            timestamp: new Date().toISOString(),
+          });
+          
+          // Wait for match establishment period to pass, then check if still disconnected
+          setTimeout(() => {
+            const currentGame = games.get(ws.gameId);
+            if (!currentGame || currentGame.isEnded) return;
+            
+            const disconnectedWs = disconnectedColor === "w" ? currentGame.whiteWs : currentGame.blackWs;
+            const isStillDisconnected = !disconnectedWs || 
+                                       disconnectedWs.readyState !== disconnectedWs.OPEN ||
+                                       disconnectedWs.userId !== disconnectedUserId;
+            
+            if (isStillDisconnected && !currentGame.disconnectedPlayer) {
+              // Still disconnected after grace period - start normal disconnect handling
+              console.log("[Server] Player still disconnected after match establishment period - starting disconnect timer", {
+                gameId: ws.gameId,
+                disconnectedPlayerColor: disconnectedColor,
+                timestamp: new Date().toISOString(),
+              });
+              
+              // Clear any existing disconnect timer
+              if (currentGame.disconnectTimer) {
+                clearTimeout(currentGame.disconnectTimer);
+                currentGame.disconnectTimer = null;
+              }
+              
+              // Mark player as disconnected
+              currentGame.disconnectedAt = Date.now();
+              currentGame.disconnectedPlayer = disconnectedColor;
+              
+              // Clear the WebSocket reference for the disconnected player
+              if (disconnectedColor === "w") {
+                currentGame.whiteWs = null;
+              } else {
+                currentGame.blackWs = null;
+              }
+              
+              // Notify opponent that player disconnected (but game not ended yet)
+              const opponentWs = disconnectedColor === "w" ? currentGame.blackWs : currentGame.whiteWs;
+              if (opponentWs && opponentWs.readyState === opponentWs.OPEN) {
+                safeSend(opponentWs, {
+                  type: "opponent_disconnected",
+                  message: "Opponent disconnected. Waiting for reconnection...",
+                  gracePeriodSeconds: 30,
+                });
+              }
+              
+              // Set grace period timer (30 seconds)
+              const GRACE_PERIOD_MS = 30000; // 30 seconds
+              const gameIdForTimer = ws.gameId;
+              currentGame.disconnectTimer = setTimeout(() => {
+                // Check if player reconnected
+                const finalGame = games.get(gameIdForTimer);
+                if (!finalGame || finalGame.isEnded) {
+                  return; // Game already ended or doesn't exist
+                }
+                
+                // Check if the disconnected player reconnected
+                const disconnectedWs = disconnectedColor === "w" ? finalGame.whiteWs : finalGame.blackWs;
+                const isReconnected = disconnectedWs && 
+                                      disconnectedWs.readyState === disconnectedWs.OPEN &&
+                                      disconnectedWs.userId === disconnectedUserId;
+                
+                if (!isReconnected) {
+                  // Player did not reconnect within grace period - end game
+                  console.log("[Server] Disconnect grace period expired - ending game", {
+                    gameId: gameIdForTimer,
+                    disconnectedPlayerColor: disconnectedColor,
+                    timestamp: new Date().toISOString(),
+                  });
+                  
+                  const winnerColor = disconnectedColor === "w" ? "b" : "w";
+                  endGame(gameIdForTimer, "disconnect_timeout", winnerColor);
+                } else {
+                  // Player reconnected - clear disconnect state
+                  console.log("[Server] Player reconnected within grace period", {
+                    gameId: gameIdForTimer,
+                    reconnectedPlayerColor: disconnectedColor,
+                    timestamp: new Date().toISOString(),
+                  });
+                  
+                  finalGame.disconnectedAt = null;
+                  finalGame.disconnectedPlayer = null;
+                  finalGame.disconnectTimer = null;
+                  
+                  // Notify opponent that player reconnected
+                  const opponentWs = disconnectedColor === "w" ? finalGame.blackWs : finalGame.whiteWs;
+                  if (opponentWs && opponentWs.readyState === opponentWs.OPEN) {
+                    safeSend(opponentWs, {
+                      type: "opponent_reconnected",
+                      message: "Opponent reconnected.",
+                    });
+                  }
+                }
+              }, GRACE_PERIOD_MS);
+            }
+          }, MATCH_ESTABLISHMENT_GRACE_MS - gameAge);
+          return;
+        }
+        
+        // Existing disconnect handling for established games
         // Clear any existing disconnect timer
         if (game.disconnectTimer) {
           clearTimeout(game.disconnectTimer);
