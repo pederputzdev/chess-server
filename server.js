@@ -638,14 +638,14 @@ function handleMove(ws, data) {
     return;
   }
   
-  // Add increment (3 seconds = 3000ms) to the player who just moved
+  // Add increment (5 seconds = 5000ms) to the player who just moved
   const newTurn = chess.turn();  // Turn after move (opposite of previousTurn)
   if (previousTurn === 'w') {
     // White just moved, add increment to white
-    game.whiteTimeMs += 3000;
+    game.whiteTimeMs += 5000;
   } else {
     // Black just moved, add increment to black
-    game.blackTimeMs += 3000;
+    game.blackTimeMs += 5000;
   }
   
   // Update last tick timestamp
