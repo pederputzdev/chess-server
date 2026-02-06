@@ -552,6 +552,11 @@ async function endGame(localGameId, reason, winnerColor = null) {
   games.delete(localGameId);
 }
 
+// REMOVED: updateGameState was being called on EVERY move, causing excessive Supabase writes
+// Game state is now only written to DB at game creation and game end
+// Live game state is authoritative in the WebSocket server memory
+// This reduces Supabase writes by ~50-100 per game
+/*
 async function updateGameState(game) {
   try {
     await callGameServer("update_game_state", {
@@ -563,6 +568,7 @@ async function updateGameState(game) {
     // non-fatal
   }
 }
+*/
 
 // Calculate current clocks from server time (server-authoritative)
 // This function calculates the current display values without mutating game state
@@ -669,7 +675,8 @@ function handleMove(ws, data) {
   safeSend(game.whiteWs, broadcast);
   safeSend(game.blackWs, broadcast);
 
-  updateGameState(game);
+  // REMOVED: updateGameState(game) call - was causing Supabase writes on every move
+  // Game state is only written to DB at game end via endGame()
 
   if (chess.isGameOver()) {
     let reason = "game_over";
