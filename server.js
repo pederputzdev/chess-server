@@ -254,8 +254,88 @@ const queues = new Map();
 const games = new Map();
 
 // Pending private games waiting for both players to connect via WebSocket
-// supabaseGameId -> { localGameId, supabaseGameId, chess, wager, whiteUserId, blackUserId, whiteName, blackName, whiteWs, blackWs }
+// supabaseGameId -> { localGameId, supabaseGameId, chess, wager, whiteUserId, blackUserId, whiteName, blackName, whiteWs, blackWs, loading, queuedClients }
 const pendingPrivateGames = new Map();
+
+// Helper: promote a pending private game to an active game once both players connect
+async function promoteToActiveGame(pending, supabaseGameId) {
+  const nowMs = Date.now();
+  const activeGame = {
+    localGameId: pending.localGameId,
+    supabaseGameId: pending.supabaseGameId,
+    wager: pending.wager,
+    chess: pending.chess,
+    whiteWs: pending.whiteWs,
+    blackWs: pending.blackWs,
+    whiteId: pending.whiteUserId,
+    blackId: pending.blackUserId,
+    whiteTimeMs: 60000,
+    blackTimeMs: 60000,
+    lastTickServerTimeMs: nowMs,
+    isEnded: false,
+    createdAt: nowMs,
+    disconnectedAt: null,
+    disconnectedPlayer: null,
+    disconnectTimer: null,
+  };
+
+  games.set(pending.localGameId, activeGame);
+  pendingPrivateGames.delete(supabaseGameId);
+
+  console.log("[Server] join_game: both players connected, game started", {
+    supabaseGameId,
+    localGameId: pending.localGameId,
+    whiteUserId: pending.whiteUserId,
+    blackUserId: pending.blackUserId,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Update DB game status to 'active' so end_game settlement works
+  try {
+    await callGameServer("activate_game", { game_id: supabaseGameId });
+    console.log("[Server] join_game: DB game status set to active", { supabaseGameId });
+  } catch (e) {
+    console.error("[Server] join_game: failed to activate DB game", {
+      supabaseGameId,
+      error: e.message || String(e),
+    });
+    // Continue anyway - game can still be played
+  }
+
+  const serverTimeMs = activeGame.lastTickServerTimeMs;
+
+  safeSend(pending.whiteWs, {
+    type: "match_found",
+    gameId: pending.localGameId,
+    dbGameId: supabaseGameId,
+    color: "w",
+    wager: pending.wager,
+    fen: pending.chess.fen(),
+    whiteTime: 60,
+    blackTime: 60,
+    serverTimeMs,
+    opponent: {
+      user_id: pending.blackUserId,
+      name: pending.blackName,
+    },
+  });
+
+  safeSend(pending.blackWs, {
+    type: "match_found",
+    gameId: pending.localGameId,
+    dbGameId: supabaseGameId,
+    color: "b",
+    wager: pending.wager,
+    fen: pending.chess.fen(),
+    whiteTime: 60,
+    blackTime: 60,
+    serverTimeMs,
+    opponent: {
+      user_id: pending.whiteUserId,
+      name: pending.whiteName,
+    },
+  });
+}
 
 function enqueue(ws, wager) {
   const q = queues.get(wager) || [];
@@ -1031,71 +1111,142 @@ wss.on("connection", async (ws, req) => {
           let pending = pendingPrivateGames.get(supabaseGameId);
 
           if (!pending) {
-            // First player arriving - fetch game from DB
+            // First player arriving — IMMEDIATELY reserve the slot BEFORE any async work
+            // This prevents a race condition where both players enter this block
+            // simultaneously during the await callGameServer("get_game") call.
+            const localGameId = `g_${Math.random().toString(36).slice(2, 10)}`;
+            pending = {
+              localGameId,
+              supabaseGameId,
+              loading: true,          // Still fetching game data from DB
+              queuedClients: [],      // Other clients that arrive while loading
+              chess: null,
+              wager: 0,
+              whiteUserId: null,
+              blackUserId: null,
+              whiteName: null,
+              blackName: null,
+              whiteWs: null,
+              blackWs: null,
+            };
+            pendingPrivateGames.set(supabaseGameId, pending);
+
             try {
               const gameData = await callGameServer("get_game", { game_id: supabaseGameId });
               if (!gameData.success || !gameData.game) {
+                pendingPrivateGames.delete(supabaseGameId);
                 safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found in database." });
+                for (const qws of pending.queuedClients) {
+                  safeSend(qws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found in database." });
+                }
                 return;
               }
 
               const gd = gameData.game;
 
-              // Verify this user is a participant
-              const isWhite = ws.userId === gd.white_user_id;
-              const isBlack = ws.userId === gd.black_user_id;
+              // Populate the pending entry with game data
+              pending.chess = new Chess(gd.fen || "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+              pending.wager = gd.wager || 0;
+              pending.whiteUserId = gd.white_user_id;
+              pending.blackUserId = gd.black_user_id;
+              pending.whiteName = gd.white_name || null;
+              pending.blackName = gd.black_name || null;
+              pending.loading = false;
+
+              // Assign THIS player (the one who triggered the fetch)
+              const isWhite = ws.userId === pending.whiteUserId;
+              const isBlack = ws.userId === pending.blackUserId;
               if (!isWhite && !isBlack) {
+                pendingPrivateGames.delete(supabaseGameId);
                 safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not a player in this game." });
+                for (const qws of pending.queuedClients) {
+                  safeSend(qws, { type: "error", code: "NOT_IN_GAME", message: "You are not a player in this game." });
+                }
                 return;
               }
 
-              const localGameId = `g_${Math.random().toString(36).slice(2, 10)}`;
-              const chess = new Chess(gd.fen || "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-
-              pending = {
-                localGameId,
-                supabaseGameId,
-                chess,
-                wager: gd.wager || 0,
-                whiteUserId: gd.white_user_id,
-                blackUserId: gd.black_user_id,
-                whiteName: gd.white_name || null,
-                blackName: gd.black_name || null,
-                whiteWs: isWhite ? ws : null,
-                blackWs: isBlack ? ws : null,
-              };
-
+              if (isWhite) pending.whiteWs = ws;
+              else pending.blackWs = ws;
               ws.gameId = localGameId;
               ws.color = isWhite ? "w" : "b";
 
-              pendingPrivateGames.set(supabaseGameId, pending);
-
-              console.log("[Server] join_game: first player joined", {
+              console.log("[Server] join_game: first player loaded", {
                 supabaseGameId,
                 localGameId,
                 userId: ws.userId,
                 color: ws.color,
+                queuedCount: pending.queuedClients.length,
                 timestamp: new Date().toISOString(),
               });
 
-              safeSend(ws, {
-                type: "waiting_for_opponent",
-                message: "Connected to game. Waiting for opponent...",
-                gameId: localGameId,
-                dbGameId: supabaseGameId,
-              });
+              // Process any queued clients that arrived during the await
+              for (const queuedWs of pending.queuedClients) {
+                if (queuedWs.readyState !== queuedWs.OPEN) continue;
+                const qIsWhite = queuedWs.userId === pending.whiteUserId;
+                const qIsBlack = queuedWs.userId === pending.blackUserId;
+                if (!qIsWhite && !qIsBlack) {
+                  safeSend(queuedWs, { type: "error", code: "NOT_IN_GAME", message: "You are not a player in this game." });
+                  continue;
+                }
+                if (qIsWhite) pending.whiteWs = queuedWs;
+                else pending.blackWs = queuedWs;
+                queuedWs.gameId = pending.localGameId;
+                queuedWs.color = qIsWhite ? "w" : "b";
+                console.log("[Server] join_game: queued player assigned", {
+                  supabaseGameId,
+                  userId: queuedWs.userId,
+                  color: queuedWs.color,
+                });
+              }
+              pending.queuedClients = [];
+
+              // Check if both players are now connected — promote to active game
+              if (pending.whiteWs && pending.blackWs &&
+                  pending.whiteWs.readyState === pending.whiteWs.OPEN &&
+                  pending.blackWs.readyState === pending.blackWs.OPEN) {
+                promoteToActiveGame(pending, supabaseGameId);
+              } else {
+                // Send waiting to whoever is connected
+                if (pending.whiteWs && pending.whiteWs.readyState === pending.whiteWs.OPEN) {
+                  safeSend(pending.whiteWs, { type: "waiting_for_opponent", message: "Connected. Waiting for opponent...", gameId: localGameId, dbGameId: supabaseGameId });
+                }
+                if (pending.blackWs && pending.blackWs.readyState === pending.blackWs.OPEN) {
+                  safeSend(pending.blackWs, { type: "waiting_for_opponent", message: "Connected. Waiting for opponent...", gameId: localGameId, dbGameId: supabaseGameId });
+                }
+              }
               return;
             } catch (e) {
+              pendingPrivateGames.delete(supabaseGameId);
               console.error("[Server] join_game: error fetching game", {
                 supabaseGameId,
                 error: e.message || String(e),
               });
               safeSend(ws, { type: "error", code: "GAME_FETCH_FAILED", message: "Failed to load game: " + (e.message || String(e)) });
+              for (const qws of pending.queuedClients) {
+                safeSend(qws, { type: "error", code: "GAME_FETCH_FAILED", message: "Failed to load game." });
+              }
               return;
             }
           }
 
-          // Pending entry exists - second player (or reconnecting first player)
+          // Pending entry exists but game data is still being fetched
+          if (pending.loading) {
+            console.log("[Server] join_game: game still loading, queuing client", {
+              supabaseGameId,
+              userId: ws.userId,
+              queueLength: pending.queuedClients.length,
+            });
+            pending.queuedClients.push(ws);
+            safeSend(ws, {
+              type: "waiting_for_opponent",
+              message: "Loading game data...",
+              gameId: pending.localGameId,
+              dbGameId: supabaseGameId,
+            });
+            return;
+          }
+
+          // Pending entry exists and is loaded - second player (or reconnecting first player)
           const isWhite = ws.userId === pending.whiteUserId;
           const isBlack = ws.userId === pending.blackUserId;
 
@@ -1113,90 +1264,18 @@ wss.on("connection", async (ws, req) => {
           ws.gameId = pending.localGameId;
           ws.color = isWhite ? "w" : "b";
 
+          console.log("[Server] join_game: player joined existing pending", {
+            supabaseGameId,
+            userId: ws.userId,
+            color: ws.color,
+            timestamp: new Date().toISOString(),
+          });
+
           // Check if both players are now connected
           if (pending.whiteWs && pending.blackWs &&
               pending.whiteWs.readyState === pending.whiteWs.OPEN &&
               pending.blackWs.readyState === pending.blackWs.OPEN) {
-            // Both connected! Promote to active game.
-            const nowMs = Date.now();
-            const activeGame = {
-              localGameId: pending.localGameId,
-              supabaseGameId: pending.supabaseGameId,
-              wager: pending.wager,
-              chess: pending.chess,
-              whiteWs: pending.whiteWs,
-              blackWs: pending.blackWs,
-              whiteId: pending.whiteUserId,
-              blackId: pending.blackUserId,
-              whiteTimeMs: 60000,
-              blackTimeMs: 60000,
-              lastTickServerTimeMs: nowMs,
-              isEnded: false,
-              createdAt: nowMs,
-              disconnectedAt: null,
-              disconnectedPlayer: null,
-              disconnectTimer: null,
-            };
-
-            games.set(pending.localGameId, activeGame);
-            pendingPrivateGames.delete(supabaseGameId);
-
-            console.log("[Server] join_game: both players connected, game started", {
-              supabaseGameId,
-              localGameId: pending.localGameId,
-              whiteUserId: pending.whiteUserId,
-              blackUserId: pending.blackUserId,
-              timestamp: new Date().toISOString(),
-            });
-
-            // Update DB game status to 'active' so end_game settlement works
-            // Wagers are already locked by join_private_room RPC
-            try {
-              await callGameServer("activate_game", {
-                game_id: supabaseGameId,
-              });
-              console.log("[Server] join_game: DB game status set to active", { supabaseGameId });
-            } catch (e) {
-              console.error("[Server] join_game: failed to activate DB game", {
-                supabaseGameId,
-                error: e.message || String(e),
-              });
-              // Continue anyway - game can still be played, settlement may need manual fix
-            }
-
-            const serverTimeMs = activeGame.lastTickServerTimeMs;
-
-            safeSend(pending.whiteWs, {
-              type: "match_found",
-              gameId: pending.localGameId,
-              dbGameId: supabaseGameId,
-              color: "w",
-              wager: pending.wager,
-              fen: pending.chess.fen(),
-              whiteTime: 60,
-              blackTime: 60,
-              serverTimeMs,
-              opponent: {
-                user_id: pending.blackUserId,
-                name: pending.blackName,
-              },
-            });
-
-            safeSend(pending.blackWs, {
-              type: "match_found",
-              gameId: pending.localGameId,
-              dbGameId: supabaseGameId,
-              color: "b",
-              wager: pending.wager,
-              fen: pending.chess.fen(),
-              whiteTime: 60,
-              blackTime: 60,
-              serverTimeMs,
-              opponent: {
-                user_id: pending.whiteUserId,
-                name: pending.whiteName,
-              },
-            });
+            promoteToActiveGame(pending, supabaseGameId);
           } else {
             safeSend(ws, {
               type: "waiting_for_opponent",
