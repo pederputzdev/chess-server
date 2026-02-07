@@ -253,6 +253,10 @@ const queues = new Map();
 // games: localId -> { chess, whiteWs, blackWs, supabaseGameId, wager, whiteId, blackId }
 const games = new Map();
 
+// Pending private games waiting for both players to connect via WebSocket
+// supabaseGameId -> { localGameId, supabaseGameId, chess, wager, whiteUserId, blackUserId, whiteName, blackName, whiteWs, blackWs }
+const pendingPrivateGames = new Map();
+
 function enqueue(ws, wager) {
   const q = queues.get(wager) || [];
   q.push(ws);
@@ -987,6 +991,205 @@ wss.on("connection", async (ws, req) => {
             status: game.isEnded ? "ended" : "active",
             wager: game.wager,
           });
+          return;
+        }
+
+        if (data.type === "join_game") {
+          // Private game: player sends join_game with a Supabase game UUID
+          const supabaseGameId = data.gameId;
+          if (!supabaseGameId) {
+            safeSend(ws, { type: "error", code: "MISSING_GAME_ID", message: "gameId is required for join_game." });
+            return;
+          }
+
+          // If player is already in a game for this same supabaseGameId, send sync
+          if (ws.gameId) {
+            const existingGame = games.get(ws.gameId);
+            if (existingGame && existingGame.supabaseGameId === supabaseGameId) {
+              const clocks = calculateCurrentClocks(existingGame);
+              safeSend(ws, {
+                type: "game_sync",
+                gameId: ws.gameId,
+                dbGameId: existingGame.supabaseGameId,
+                fen: existingGame.chess.fen(),
+                turn: existingGame.chess.turn(),
+                whiteTime: clocks.whiteTime,
+                blackTime: clocks.blackTime,
+                serverTimeMs: clocks.serverTimeMs,
+                status: existingGame.isEnded ? "ended" : "active",
+                wager: existingGame.wager,
+                color: ws.color,
+              });
+              return;
+            }
+            // In a different game - error
+            safeSend(ws, { type: "error", code: "ALREADY_IN_GAME", message: "You are already in a different game." });
+            return;
+          }
+
+          // Check if there's already a pending entry for this game
+          let pending = pendingPrivateGames.get(supabaseGameId);
+
+          if (!pending) {
+            // First player arriving - fetch game from DB
+            try {
+              const gameData = await callGameServer("get_game", { game_id: supabaseGameId });
+              if (!gameData.success || !gameData.game) {
+                safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found in database." });
+                return;
+              }
+
+              const gd = gameData.game;
+
+              // Verify this user is a participant
+              const isWhite = ws.userId === gd.white_user_id;
+              const isBlack = ws.userId === gd.black_user_id;
+              if (!isWhite && !isBlack) {
+                safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not a player in this game." });
+                return;
+              }
+
+              const localGameId = `g_${Math.random().toString(36).slice(2, 10)}`;
+              const chess = new Chess(gd.fen || "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+              pending = {
+                localGameId,
+                supabaseGameId,
+                chess,
+                wager: gd.wager || 0,
+                whiteUserId: gd.white_user_id,
+                blackUserId: gd.black_user_id,
+                whiteName: gd.white_name || null,
+                blackName: gd.black_name || null,
+                whiteWs: isWhite ? ws : null,
+                blackWs: isBlack ? ws : null,
+              };
+
+              ws.gameId = localGameId;
+              ws.color = isWhite ? "w" : "b";
+
+              pendingPrivateGames.set(supabaseGameId, pending);
+
+              console.log("[Server] join_game: first player joined", {
+                supabaseGameId,
+                localGameId,
+                userId: ws.userId,
+                color: ws.color,
+                timestamp: new Date().toISOString(),
+              });
+
+              safeSend(ws, {
+                type: "waiting_for_opponent",
+                message: "Connected to game. Waiting for opponent...",
+                gameId: localGameId,
+                dbGameId: supabaseGameId,
+              });
+              return;
+            } catch (e) {
+              console.error("[Server] join_game: error fetching game", {
+                supabaseGameId,
+                error: e.message || String(e),
+              });
+              safeSend(ws, { type: "error", code: "GAME_FETCH_FAILED", message: "Failed to load game: " + (e.message || String(e)) });
+              return;
+            }
+          }
+
+          // Pending entry exists - second player (or reconnecting first player)
+          const isWhite = ws.userId === pending.whiteUserId;
+          const isBlack = ws.userId === pending.blackUserId;
+
+          if (!isWhite && !isBlack) {
+            safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "You are not a player in this game." });
+            return;
+          }
+
+          // Assign WebSocket
+          if (isWhite) {
+            pending.whiteWs = ws;
+          } else {
+            pending.blackWs = ws;
+          }
+          ws.gameId = pending.localGameId;
+          ws.color = isWhite ? "w" : "b";
+
+          // Check if both players are now connected
+          if (pending.whiteWs && pending.blackWs &&
+              pending.whiteWs.readyState === pending.whiteWs.OPEN &&
+              pending.blackWs.readyState === pending.blackWs.OPEN) {
+            // Both connected! Promote to active game.
+            const nowMs = Date.now();
+            const activeGame = {
+              localGameId: pending.localGameId,
+              supabaseGameId: pending.supabaseGameId,
+              wager: pending.wager,
+              chess: pending.chess,
+              whiteWs: pending.whiteWs,
+              blackWs: pending.blackWs,
+              whiteId: pending.whiteUserId,
+              blackId: pending.blackUserId,
+              whiteTimeMs: 60000,
+              blackTimeMs: 60000,
+              lastTickServerTimeMs: nowMs,
+              isEnded: false,
+              createdAt: nowMs,
+              disconnectedAt: null,
+              disconnectedPlayer: null,
+              disconnectTimer: null,
+            };
+
+            games.set(pending.localGameId, activeGame);
+            pendingPrivateGames.delete(supabaseGameId);
+
+            console.log("[Server] join_game: both players connected, game started", {
+              supabaseGameId,
+              localGameId: pending.localGameId,
+              whiteUserId: pending.whiteUserId,
+              blackUserId: pending.blackUserId,
+              timestamp: new Date().toISOString(),
+            });
+
+            const serverTimeMs = activeGame.lastTickServerTimeMs;
+
+            safeSend(pending.whiteWs, {
+              type: "match_found",
+              gameId: pending.localGameId,
+              dbGameId: supabaseGameId,
+              color: "w",
+              wager: pending.wager,
+              fen: pending.chess.fen(),
+              whiteTime: 60,
+              blackTime: 60,
+              serverTimeMs,
+              opponent: {
+                user_id: pending.blackUserId,
+                name: pending.blackName,
+              },
+            });
+
+            safeSend(pending.blackWs, {
+              type: "match_found",
+              gameId: pending.localGameId,
+              dbGameId: supabaseGameId,
+              color: "b",
+              wager: pending.wager,
+              fen: pending.chess.fen(),
+              whiteTime: 60,
+              blackTime: 60,
+              serverTimeMs,
+              opponent: {
+                user_id: pending.whiteUserId,
+                name: pending.whiteName,
+              },
+            });
+          } else {
+            safeSend(ws, {
+              type: "waiting_for_opponent",
+              message: "Connected to game. Waiting for opponent...",
+              gameId: pending.localGameId,
+              dbGameId: supabaseGameId,
+            });
+          }
           return;
         }
 
