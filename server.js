@@ -911,7 +911,7 @@ wss.on("connection", async (ws, req) => {
       });
     }
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     // Wrap entire message handler in try/catch to prevent crashes
     try {
       let data;
