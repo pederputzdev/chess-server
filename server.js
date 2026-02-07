@@ -1149,6 +1149,21 @@ wss.on("connection", async (ws, req) => {
               timestamp: new Date().toISOString(),
             });
 
+            // Update DB game status to 'active' so end_game settlement works
+            // Wagers are already locked by join_private_room RPC
+            try {
+              await callGameServer("activate_game", {
+                game_id: supabaseGameId,
+              });
+              console.log("[Server] join_game: DB game status set to active", { supabaseGameId });
+            } catch (e) {
+              console.error("[Server] join_game: failed to activate DB game", {
+                supabaseGameId,
+                error: e.message || String(e),
+              });
+              // Continue anyway - game can still be played, settlement may need manual fix
+            }
+
             const serverTimeMs = activeGame.lastTickServerTimeMs;
 
             safeSend(pending.whiteWs, {
