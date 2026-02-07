@@ -856,6 +856,20 @@ wss.on("connection", async (ws, req) => {
     ws.isAlive = true;
     ws.on("pong", heartbeat);
 
+    // CRITICAL: Register message handler IMMEDIATELY before any async work.
+    // Messages that arrive during auth (e.g. join_game) are queued and
+    // replayed after auth completes. Without this, messages are silently lost.
+    let authComplete = false;
+    const earlyMessageQueue = [];
+    
+    ws.on("message", async (raw) => {
+      if (!authComplete) {
+        earlyMessageQueue.push(raw);
+        return;
+      }
+      handleWsMessage(ws, raw);
+    });
+
     const parsed = url.parse(req.url, true);
 
     // token can be string | string[] | undefined
@@ -991,7 +1005,17 @@ wss.on("connection", async (ws, req) => {
       });
     }
 
-  ws.on("message", async (raw) => {
+    // Auth is done — mark complete and replay any messages that arrived during auth
+    authComplete = true;
+    if (earlyMessageQueue.length > 0) {
+      console.log("[Server] Replaying", earlyMessageQueue.length, "early message(s) for user", userId);
+      for (const queuedRaw of earlyMessageQueue) {
+        await handleWsMessage(ws, queuedRaw);
+      }
+      earlyMessageQueue.length = 0;
+    }
+
+  async function handleWsMessage(ws, raw) {
     // Wrap entire message handler in try/catch to prevent crashes
     try {
       let data;
@@ -1377,7 +1401,7 @@ wss.on("connection", async (ws, req) => {
       });
       // Do NOT crash, do NOT end game
     }
-  });
+  }
 
   ws.on("close", () => {
     if (ws.inQueue) removeFromQueue(ws);
