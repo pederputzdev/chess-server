@@ -486,6 +486,8 @@ async function endGame(localGameId, reason, winnerColor = null) {
       winnerColor: game.lastWinnerColor || winnerColor,
       gameId: localGameId,  // Always include gameId
       dbGameId: game.supabaseGameId,  // Always include dbGameId
+      wager: game.wager || 0,
+      creditsUpdated: true,  // DB was already updated on first endGame call
     };
     console.log("[Server] Sending idempotent game_ended to both players", {
       gameId: localGameId,
@@ -500,33 +502,15 @@ async function endGame(localGameId, reason, winnerColor = null) {
   game.lastEndReason = reason;
   game.lastWinnerColor = winnerColor;
 
-  const payload = {
-    type: "game_ended",
-    reason,
-    winnerColor,
-    gameId: localGameId,  // Always include gameId
-    dbGameId: game.supabaseGameId,  // Always include dbGameId
-  };
-
-  console.log("[Server] Sending game_ended to both players", {
-    gameId: localGameId,
-    dbGameId: game.supabaseGameId,
-    reason,
-    winnerColor,
-    whitePlayerId: game.whiteId,
-    blackPlayerId: game.blackId,
-    payload,
-    timestamp: new Date().toISOString(),
-  });
-
-  safeSend(game.whiteWs, payload);
-  safeSend(game.blackWs, payload);
-
   // Winner user id
   let winnerId = null;
   if (winnerColor === "w") winnerId = game.whiteId;
   if (winnerColor === "b") winnerId = game.blackId;
 
+  // IMPORTANT: Update DB credits BEFORE broadcasting game_ended to clients.
+  // This ensures that when clients refresh their balance, the DB already
+  // reflects the correct amount.
+  let creditsUpdated = false;
   try {
     await callGameServer("end_game", {
       game_id: game.supabaseGameId,
@@ -535,10 +519,43 @@ async function endGame(localGameId, reason, winnerColor = null) {
       ...(winnerId ? withPlayerIdVariants(winnerId) : {}),
       winner_id: winnerId,
     });
+    creditsUpdated = true;
   } catch (e) {
+    console.error("[Server] end_game DB update failed", {
+      gameId: localGameId,
+      dbGameId: game.supabaseGameId,
+      error: e.message || String(e),
+      timestamp: new Date().toISOString(),
+    });
     safeSend(game.whiteWs, { type: "error", code: "END_GAME_FAILED", message: String(e.message || e) });
     safeSend(game.blackWs, { type: "error", code: "END_GAME_FAILED", message: String(e.message || e) });
   }
+
+  // Now broadcast game_ended with wager + creditsUpdated flag
+  const payload = {
+    type: "game_ended",
+    reason,
+    winnerColor,
+    gameId: localGameId,
+    dbGameId: game.supabaseGameId,
+    wager: game.wager || 0,
+    creditsUpdated,  // true = DB already updated, safe to refresh
+  };
+
+  console.log("[Server] Sending game_ended to both players", {
+    gameId: localGameId,
+    dbGameId: game.supabaseGameId,
+    reason,
+    winnerColor,
+    wager: game.wager,
+    creditsUpdated,
+    whitePlayerId: game.whiteId,
+    blackPlayerId: game.blackId,
+    timestamp: new Date().toISOString(),
+  });
+
+  safeSend(game.whiteWs, payload);
+  safeSend(game.blackWs, payload);
 
   if (game.whiteWs) {
     game.whiteWs.gameId = null;
