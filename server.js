@@ -257,6 +257,25 @@ const games = new Map();
 // supabaseGameId -> { localGameId, supabaseGameId, chess, wager, whiteUserId, blackUserId, whiteName, blackName, whiteWs, blackWs, loading, queuedClients }
 const pendingPrivateGames = new Map();
 
+// PART C: In-memory cache for game metadata (avoids duplicate Supabase reads on join_game)
+// supabaseGameId -> { game data, timestamp }
+const gameMetadataCache = new Map();
+const GAME_METADATA_CACHE_TTL_MS = 60_000; // 60 seconds
+
+function getCachedGameMetadata(supabaseGameId) {
+  const entry = gameMetadataCache.get(supabaseGameId);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > GAME_METADATA_CACHE_TTL_MS) {
+    gameMetadataCache.delete(supabaseGameId);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedGameMetadata(supabaseGameId, data) {
+  gameMetadataCache.set(supabaseGameId, { data, cachedAt: Date.now() });
+}
+
 // Helper: promote a pending private game to an active game once both players connect
 async function promoteToActiveGame(pending, supabaseGameId) {
   const nowMs = Date.now();
@@ -271,9 +290,12 @@ async function promoteToActiveGame(pending, supabaseGameId) {
     blackId: pending.blackUserId,
     whiteTimeMs: 60000,
     blackTimeMs: 60000,
-    lastTickServerTimeMs: nowMs,
     isEnded: false,
     createdAt: nowMs,
+    // Clock state (server-authoritative)
+    startedAt: null,           // null until first legal move
+    clockRunning: false,       // clocks frozen until first move
+    lastTurnStartedAt: null,   // server timestamp when current turn began
     disconnectedAt: null,
     disconnectedPlayer: null,
     disconnectTimer: null,
@@ -302,7 +324,7 @@ async function promoteToActiveGame(pending, supabaseGameId) {
     // Continue anyway - game can still be played
   }
 
-  const serverTimeMs = activeGame.lastTickServerTimeMs;
+  const serverNow = Date.now();
 
   safeSend(pending.whiteWs, {
     type: "match_found",
@@ -311,9 +333,19 @@ async function promoteToActiveGame(pending, supabaseGameId) {
     color: "w",
     wager: pending.wager,
     fen: pending.chess.fen(),
+    turn: "w",
+    // New ms-precision clock snapshot
+    wMs: 60000,
+    bMs: 60000,
+    clockRunning: false,
+    serverNow,
+    lastMoveAt: null,
+    whiteId: pending.whiteUserId,
+    blackId: pending.blackUserId,
+    // Legacy seconds fields
     whiteTime: 60,
     blackTime: 60,
-    serverTimeMs,
+    serverTimeMs: serverNow,
     opponent: {
       user_id: pending.blackUserId,
       name: pending.blackName,
@@ -327,9 +359,19 @@ async function promoteToActiveGame(pending, supabaseGameId) {
     color: "b",
     wager: pending.wager,
     fen: pending.chess.fen(),
+    turn: "w",
+    // New ms-precision clock snapshot
+    wMs: 60000,
+    bMs: 60000,
+    clockRunning: false,
+    serverNow,
+    lastMoveAt: null,
+    whiteId: pending.whiteUserId,
+    blackId: pending.blackUserId,
+    // Legacy seconds fields
     whiteTime: 60,
     blackTime: 60,
-    serverTimeMs,
+    serverTimeMs: serverNow,
     opponent: {
       user_id: pending.whiteUserId,
       name: pending.whiteName,
@@ -463,20 +505,23 @@ async function tryMatchmake(wager) {
     whiteId: a.userId,
     blackId: b.userId,
     // Timer state (server-authoritative)
-    whiteTimeMs: 60000,  // 60 seconds in milliseconds
-    blackTimeMs: 60000,  // 60 seconds in milliseconds
-    lastTickServerTimeMs: nowMs,  // Server timestamp when clocks were last updated
-    isEnded: false,  // Track if game has ended (for idempotent operations)
-    createdAt: nowMs,  // Track when game was created (for match establishment grace period)
+    whiteTimeMs: 60000,
+    blackTimeMs: 60000,
+    isEnded: false,
+    createdAt: nowMs,
+    // Clock state
+    startedAt: null,           // null until first legal move
+    clockRunning: false,       // clocks frozen until first move
+    lastTurnStartedAt: null,   // server timestamp when current turn began
     // Disconnect grace period state
-    disconnectedAt: null,  // Timestamp when player disconnected (null if both connected)
-    disconnectedPlayer: null,  // 'w' or 'b' if a player is disconnected, null if both connected
-    disconnectTimer: null,  // setTimeout handle for grace period timer
+    disconnectedAt: null,
+    disconnectedPlayer: null,
+    disconnectTimer: null,
   });
 
   // Get the game object to access timer state
   const game = games.get(localGameId);
-  const serverTimeMs = game.lastTickServerTimeMs;
+  const serverNow = Date.now();
 
   safeSend(a, {
     type: "match_found",
@@ -485,9 +530,19 @@ async function tryMatchmake(wager) {
     color: "w",
     wager,
     fen: chess.fen(),
-    whiteTime: 60,  // Initial time in seconds
-    blackTime: 60,  // Initial time in seconds
-    serverTimeMs,   // Server timestamp
+    turn: "w",
+    // New ms-precision clock snapshot
+    wMs: 60000,
+    bMs: 60000,
+    clockRunning: false,
+    serverNow,
+    lastMoveAt: null,
+    whiteId: a.userId,
+    blackId: b.userId,
+    // Legacy seconds fields
+    whiteTime: 60,
+    blackTime: 60,
+    serverTimeMs: serverNow,
     opponent: {
       user_id: b.userId,
       name: bProfile?.name || bProfile?.username || bProfile?.display_name || null,
@@ -501,9 +556,19 @@ async function tryMatchmake(wager) {
     color: "b",
     wager,
     fen: chess.fen(),
-    whiteTime: 60,  // Initial time in seconds
-    blackTime: 60,  // Initial time in seconds
-    serverTimeMs,   // Server timestamp
+    turn: "w",
+    // New ms-precision clock snapshot
+    wMs: 60000,
+    bMs: 60000,
+    clockRunning: false,
+    serverNow,
+    lastMoveAt: null,
+    whiteId: a.userId,
+    blackId: b.userId,
+    // Legacy seconds fields
+    whiteTime: 60,
+    blackTime: 60,
+    serverTimeMs: serverNow,
     opponent: {
       user_id: a.userId,
       name: aProfile?.name || aProfile?.username || aProfile?.display_name || null,
@@ -671,28 +736,55 @@ async function updateGameState(game) {
 }
 */
 
-// Calculate current clocks from server time (server-authoritative)
-// This function calculates the current display values without mutating game state
-function calculateCurrentClocks(game) {
-  const nowMs = Date.now();
-  const elapsedMs = nowMs - game.lastTickServerTimeMs;
-  
-  let whiteTimeMs = game.whiteTimeMs;
-  let blackTimeMs = game.blackTimeMs;
-  
-  // Only count down for the side whose turn it is
-  const currentTurn = game.chess.turn();
-  if (currentTurn === 'w') {
-    whiteTimeMs = Math.max(0, whiteTimeMs - elapsedMs);
-  } else {
-    blackTimeMs = Math.max(0, blackTimeMs - elapsedMs);
+// Calculate current clocks from server time (server-authoritative, PURE READ — no mutation)
+// Uses lastTurnStartedAt to compute elapsed time for the active side
+function calculateCurrentClocks(game, nowMs = Date.now()) {
+  let wMs = game.whiteTimeMs;
+  let bMs = game.blackTimeMs;
+  const turn = game.chess.turn();
+
+  // If clock hasn't started yet, return stored values (frozen)
+  if (!game.clockRunning || !game.lastTurnStartedAt) {
+    return {
+      wMs,
+      bMs,
+      whiteTime: Math.ceil(wMs / 1000),
+      blackTime: Math.ceil(bMs / 1000),
+      turn,
+      clockRunning: false,
+      serverNow: nowMs,
+      lastMoveAt: null,
+      whiteId: game.whiteId,
+      blackId: game.blackId,
+      // Legacy
+      whiteTimeMs: wMs,
+      blackTimeMs: bMs,
+      serverTimeMs: nowMs,
+    };
   }
-  
+
+  // Deduct elapsed since the current turn started (read-only, does NOT mutate game)
+  const elapsed = nowMs - game.lastTurnStartedAt;
+  if (turn === 'w') {
+    wMs = Math.max(0, wMs - elapsed);
+  } else {
+    bMs = Math.max(0, bMs - elapsed);
+  }
+
   return {
-    whiteTimeMs,
-    blackTimeMs,
-    whiteTime: Math.floor(whiteTimeMs / 1000),  // Convert to seconds
-    blackTime: Math.floor(blackTimeMs / 1000),  // Convert to seconds
+    wMs,
+    bMs,
+    whiteTime: Math.ceil(wMs / 1000),
+    blackTime: Math.ceil(bMs / 1000),
+    turn,
+    clockRunning: true,
+    serverNow: nowMs,
+    lastMoveAt: game.lastTurnStartedAt,
+    whiteId: game.whiteId,
+    blackId: game.blackId,
+    // Legacy
+    whiteTimeMs: wMs,
+    blackTimeMs: bMs,
     serverTimeMs: nowMs,
   };
 }
@@ -727,39 +819,53 @@ function handleMove(ws, data) {
     return;
   }
 
-  // Calculate elapsed time and deduct from the player whose turn it was
   const nowMs = Date.now();
-  const elapsedMs = nowMs - game.lastTickServerTimeMs;
-  const previousTurn = turn;  // The turn before the move (whose clock was running)
-  
-  // Deduct elapsed time from the player whose turn it was
-  if (previousTurn === 'w') {
-    game.whiteTimeMs = Math.max(0, game.whiteTimeMs - elapsedMs);
+  const previousTurn = turn;  // The side that is making this move
+  const isFirstMove = !game.clockRunning;
+
+  // --- Clock accounting (server-authoritative) ---
+  if (isFirstMove) {
+    // First move of the game: start the clock
+    game.clockRunning = true;
+    game.startedAt = nowMs;
+    game.lastTurnStartedAt = nowMs;
+    console.log("[Server] First move — clock started", {
+      gameId: localGameId,
+      startedAt: new Date(nowMs).toISOString(),
+      moverColor: previousTurn,
+    });
+    // No time deduction on first move (clock was frozen)
   } else {
-    game.blackTimeMs = Math.max(0, game.blackTimeMs - elapsedMs);
+    // Subsequent moves: deduct elapsed from the player who just moved
+    const elapsed = nowMs - game.lastTurnStartedAt;
+    if (previousTurn === 'w') {
+      game.whiteTimeMs = Math.max(0, game.whiteTimeMs - elapsed);
+      game.whiteTimeMs += 5000;  // Fischer increment (5s)
+    } else {
+      game.blackTimeMs = Math.max(0, game.blackTimeMs - elapsed);
+      game.blackTimeMs += 5000;  // Fischer increment (5s)
+    }
   }
-  
+
+  // Apply move via chess.js
   const result = chess.move(moveObj);
   if (!result) {
+    // Illegal move — revert clock changes
+    if (isFirstMove) {
+      game.clockRunning = false;
+      game.startedAt = null;
+      game.lastTurnStartedAt = null;
+    }
     safeSend(ws, { type: "error", code: "ILLEGAL_MOVE", message: "Illegal move." });
     return;
   }
-  
-  // Add increment (5 seconds = 5000ms) to the player who just moved
-  const newTurn = chess.turn();  // Turn after move (opposite of previousTurn)
-  if (previousTurn === 'w') {
-    // White just moved, add increment to white
-    game.whiteTimeMs += 5000;
-  } else {
-    // Black just moved, add increment to black
-    game.blackTimeMs += 5000;
-  }
-  
-  // Update last tick timestamp
-  game.lastTickServerTimeMs = nowMs;
-  
-  // Calculate current clocks for broadcast
-  const clocks = calculateCurrentClocks(game);
+
+  // Update lastTurnStartedAt for the NEW turn (the side that now has to move)
+  game.lastTurnStartedAt = nowMs;
+
+  // Calculate clock snapshot for broadcast (pure read, no mutation)
+  const clocks = calculateCurrentClocks(game, nowMs);
+  const newTurn = chess.turn();
 
   const broadcast = {
     type: "move_applied",
@@ -768,6 +874,15 @@ function handleMove(ws, data) {
     move: result,
     fen: chess.fen(),
     turn: newTurn,
+    // New ms-precision clock snapshot fields
+    wMs: clocks.wMs,
+    bMs: clocks.bMs,
+    clockRunning: clocks.clockRunning,
+    serverNow: clocks.serverNow,
+    lastMoveAt: clocks.lastMoveAt,
+    whiteId: game.whiteId,
+    blackId: game.blackId,
+    // Legacy seconds fields (backward compat)
     whiteTime: clocks.whiteTime,
     blackTime: clocks.blackTime,
     serverTimeMs: clocks.serverTimeMs,
@@ -776,9 +891,7 @@ function handleMove(ws, data) {
   safeSend(game.whiteWs, broadcast);
   safeSend(game.blackWs, broadcast);
 
-  // REMOVED: updateGameState(game) call - was causing Supabase writes on every move
-  // Game state is only written to DB at game end via endGame()
-
+  // Check for game over conditions
   if (chess.isGameOver()) {
     let reason = "game_over";
     let winnerColor = null;
@@ -980,13 +1093,22 @@ wss.on("connection", async (ws, req) => {
               gameId,
               dbGameId: game.supabaseGameId,
               fen: game.chess.fen(),
-              turn: game.chess.turn(),
+              turn: clocks.turn,
+              color: playerColor,
+              status: "active",
+              wager: game.wager,
+              // New ms-precision clock snapshot
+              wMs: clocks.wMs,
+              bMs: clocks.bMs,
+              clockRunning: clocks.clockRunning,
+              serverNow: clocks.serverNow,
+              lastMoveAt: clocks.lastMoveAt,
+              whiteId: game.whiteId,
+              blackId: game.blackId,
+              // Legacy seconds fields
               whiteTime: clocks.whiteTime,
               blackTime: clocks.blackTime,
               serverTimeMs: clocks.serverTimeMs,
-              status: "active",
-              wager: game.wager,
-              color: playerColor,
             });
             
             reconnectedGame = game;
@@ -1079,21 +1201,29 @@ wss.on("connection", async (ws, req) => {
             return;
           }
           
-          // Calculate current clocks from server time
+          // Calculate current clocks from server time (pure read)
           const clocks = calculateCurrentClocks(game);
           
-          // Send game sync response
           safeSend(ws, {
             type: "game_sync",
             gameId: ws.gameId,
             dbGameId: game.supabaseGameId,
             fen: game.chess.fen(),
-            turn: game.chess.turn(),
+            turn: clocks.turn,
+            status: game.isEnded ? "ended" : "active",
+            wager: game.wager,
+            // New ms-precision clock snapshot
+            wMs: clocks.wMs,
+            bMs: clocks.bMs,
+            clockRunning: clocks.clockRunning,
+            serverNow: clocks.serverNow,
+            lastMoveAt: clocks.lastMoveAt,
+            whiteId: game.whiteId,
+            blackId: game.blackId,
+            // Legacy seconds fields
             whiteTime: clocks.whiteTime,
             blackTime: clocks.blackTime,
             serverTimeMs: clocks.serverTimeMs,
-            status: game.isEnded ? "ended" : "active",
-            wager: game.wager,
           });
           return;
         }
@@ -1116,13 +1246,22 @@ wss.on("connection", async (ws, req) => {
                 gameId: ws.gameId,
                 dbGameId: existingGame.supabaseGameId,
                 fen: existingGame.chess.fen(),
-                turn: existingGame.chess.turn(),
+                turn: clocks.turn,
+                color: ws.color,
+                status: existingGame.isEnded ? "ended" : "active",
+                wager: existingGame.wager,
+                // New ms-precision clock snapshot
+                wMs: clocks.wMs,
+                bMs: clocks.bMs,
+                clockRunning: clocks.clockRunning,
+                serverNow: clocks.serverNow,
+                lastMoveAt: clocks.lastMoveAt,
+                whiteId: existingGame.whiteId,
+                blackId: existingGame.blackId,
+                // Legacy seconds fields
                 whiteTime: clocks.whiteTime,
                 blackTime: clocks.blackTime,
                 serverTimeMs: clocks.serverTimeMs,
-                status: existingGame.isEnded ? "ended" : "active",
-                wager: existingGame.wager,
-                color: ws.color,
               });
               return;
             }
@@ -1156,7 +1295,14 @@ wss.on("connection", async (ws, req) => {
             pendingPrivateGames.set(supabaseGameId, pending);
 
             try {
-              const gameData = await callGameServer("get_game", { game_id: supabaseGameId });
+              // PART C: Check in-memory cache first to avoid duplicate Supabase reads
+              let gameData = getCachedGameMetadata(supabaseGameId);
+              if (!gameData) {
+                gameData = await callGameServer("get_game", { game_id: supabaseGameId });
+                if (gameData && gameData.success && gameData.game) {
+                  setCachedGameMetadata(supabaseGameId, gameData);
+                }
+              }
               if (!gameData.success || !gameData.game) {
                 pendingPrivateGames.delete(supabaseGameId);
                 safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found in database." });
@@ -1308,6 +1454,31 @@ wss.on("connection", async (ws, req) => {
               dbGameId: supabaseGameId,
             });
           }
+          return;
+        }
+
+        if (data.type === "clock_sync_request") {
+          // Client requests a fresh clock snapshot (e.g. after alt-tab / focus)
+          if (!ws.gameId) {
+            safeSend(ws, { type: "error", code: "NOT_IN_GAME", message: "Not in a game." });
+            return;
+          }
+          const game = games.get(ws.gameId);
+          if (!game || game.isEnded) {
+            safeSend(ws, { type: "error", code: "GAME_NOT_FOUND", message: "Game not found." });
+            return;
+          }
+          const clocks = calculateCurrentClocks(game);
+          safeSend(ws, {
+            type: "clock_snapshot",
+            gameId: ws.gameId,
+            wMs: clocks.wMs,
+            bMs: clocks.bMs,
+            turn: clocks.turn,
+            clockRunning: clocks.clockRunning,
+            serverNow: clocks.serverNow,
+            lastMoveAt: clocks.lastMoveAt,
+          });
           return;
         }
 
@@ -1637,53 +1808,52 @@ wss.on("connection", async (ws, req) => {
   }
 });
 
-// Periodic clock updates and time loss detection (every 1.5 seconds)
-const CLOCK_TICK_MS = 1500;
+// Periodic clock sync and time-loss detection (1 Hz)
+// IMPORTANT: This interval does NOT mutate game.whiteTimeMs / game.blackTimeMs.
+// Clock deduction happens exclusively in handleMove. This interval only READS
+// via calculateCurrentClocks and broadcasts a sync snapshot for drift correction.
+const CLOCK_TICK_MS = 1000;
 const clockInterval = setInterval(() => {
-  const nowMs = Date.now();
-  
   for (const [localGameId, game] of games.entries()) {
-    if (game.isEnded) continue;  // Skip ended games
-    
-    // Calculate elapsed time and update clocks
-    const elapsedMs = nowMs - game.lastTickServerTimeMs;
-    const currentTurn = game.chess.turn();
-    
-    // Deduct elapsed time from the active player
-    if (currentTurn === 'w') {
-      game.whiteTimeMs = Math.max(0, game.whiteTimeMs - elapsedMs);
-    } else {
-      game.blackTimeMs = Math.max(0, game.blackTimeMs - elapsedMs);
-    }
-    
-    // Update last tick timestamp
-    game.lastTickServerTimeMs = nowMs;
-    
-    // Check for time loss
-    if (game.whiteTimeMs <= 0 && currentTurn === 'w') {
-      // White lost on time
+    if (game.isEnded) continue;
+    if (!game.clockRunning || !game.lastTurnStartedAt) continue;
+
+    // Pure read — no mutation
+    const clocks = calculateCurrentClocks(game);
+
+    // Time-loss detection
+    if (clocks.wMs <= 0 && clocks.turn === 'w') {
+      // Finalize clock before ending
+      const now = Date.now();
+      const elapsed = now - game.lastTurnStartedAt;
+      game.whiteTimeMs = Math.max(0, game.whiteTimeMs - elapsed);
+      game.lastTurnStartedAt = now;
       endGame(localGameId, "time_loss", "b");
       continue;
     }
-    if (game.blackTimeMs <= 0 && currentTurn === 'b') {
-      // Black lost on time
+    if (clocks.bMs <= 0 && clocks.turn === 'b') {
+      const now = Date.now();
+      const elapsed = now - game.lastTurnStartedAt;
+      game.blackTimeMs = Math.max(0, game.blackTimeMs - elapsed);
+      game.lastTurnStartedAt = now;
       endGame(localGameId, "time_loss", "w");
       continue;
     }
-    
-    // Broadcast clock update to both players
-    const clocks = calculateCurrentClocks(game);
-    const clockUpdate = {
-      type: "clock_update",
+
+    // Broadcast lightweight clock snapshot to both players (1Hz drift correction)
+    const snapshot = {
+      type: "clock_snapshot",
       gameId: localGameId,
-      whiteTime: clocks.whiteTime,
-      blackTime: clocks.blackTime,
-      serverTimeMs: clocks.serverTimeMs,
-      currentTurn: currentTurn,
+      wMs: clocks.wMs,
+      bMs: clocks.bMs,
+      turn: clocks.turn,
+      clockRunning: clocks.clockRunning,
+      serverNow: clocks.serverNow,
+      lastMoveAt: clocks.lastMoveAt,
     };
-    
-    safeSend(game.whiteWs, clockUpdate);
-    safeSend(game.blackWs, clockUpdate);
+
+    safeSend(game.whiteWs, snapshot);
+    safeSend(game.blackWs, snapshot);
   }
 }, CLOCK_TICK_MS);
 
