@@ -656,9 +656,41 @@ async function endGame(localGameId, reason, winnerColor = null) {
   if (winnerColor === "w") winnerId = game.whiteId;
   if (winnerColor === "b") winnerId = game.blackId;
 
-  // IMPORTANT: Update DB credits BEFORE broadcasting game_ended to clients.
-  // This ensures that when clients refresh their balance, the DB already
-  // reflects the correct amount.
+  // ── IMMEDIATELY broadcast game_ended to BOTH players ──
+  // This MUST happen BEFORE the async DB call so neither player is left
+  // waiting for the slow Supabase edge function to complete.
+  // Credits settlement happens in the background afterward.
+  const payload = {
+    type: "game_ended",
+    reason,
+    winnerColor,
+    gameId: localGameId,
+    dbGameId: game.supabaseGameId,
+    wager: game.wager || 0,
+    creditsUpdated: false,  // DB not yet updated — client will poll/retry
+  };
+
+  console.log("[Server] Sending game_ended to both players IMMEDIATELY", {
+    gameId: localGameId,
+    dbGameId: game.supabaseGameId,
+    reason,
+    winnerColor,
+    wager: game.wager,
+    whitePlayerId: game.whiteId,
+    blackPlayerId: game.blackId,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Capture WS refs before any async work (they could close during await)
+  const whiteWs = game.whiteWs;
+  const blackWs = game.blackWs;
+
+  safeSend(whiteWs, payload);
+  safeSend(blackWs, payload);
+
+  // ── Now settle credits in the background (DB update) ──
+  // If this fails, the game_ended was already sent — clients can still
+  // show the result. Balance sync will retry on the client side.
   let creditsUpdated = false;
   try {
     await callGameServer("end_game", {
@@ -669,50 +701,33 @@ async function endGame(localGameId, reason, winnerColor = null) {
       winner_id: winnerId,
     });
     creditsUpdated = true;
+    console.log("[Server] end_game DB update succeeded", {
+      gameId: localGameId,
+      dbGameId: game.supabaseGameId,
+      timestamp: new Date().toISOString(),
+    });
+    // Notify clients that credits are now settled — they can refresh balance
+    safeSend(whiteWs, { type: "credits_settled", gameId: localGameId, dbGameId: game.supabaseGameId });
+    safeSend(blackWs, { type: "credits_settled", gameId: localGameId, dbGameId: game.supabaseGameId });
   } catch (e) {
-    console.error("[Server] end_game DB update failed", {
+    console.error("[Server] end_game DB update failed (game_ended already sent)", {
       gameId: localGameId,
       dbGameId: game.supabaseGameId,
       error: e.message || String(e),
       timestamp: new Date().toISOString(),
     });
-    safeSend(game.whiteWs, { type: "error", code: "END_GAME_FAILED", message: String(e.message || e) });
-    safeSend(game.blackWs, { type: "error", code: "END_GAME_FAILED", message: String(e.message || e) });
+    safeSend(whiteWs, { type: "error", code: "END_GAME_FAILED", message: String(e.message || e) });
+    safeSend(blackWs, { type: "error", code: "END_GAME_FAILED", message: String(e.message || e) });
   }
 
-  // Now broadcast game_ended with wager + creditsUpdated flag
-  const payload = {
-    type: "game_ended",
-    reason,
-    winnerColor,
-    gameId: localGameId,
-    dbGameId: game.supabaseGameId,
-    wager: game.wager || 0,
-    creditsUpdated,  // true = DB already updated, safe to refresh
-  };
-
-  console.log("[Server] Sending game_ended to both players", {
-    gameId: localGameId,
-    dbGameId: game.supabaseGameId,
-    reason,
-    winnerColor,
-    wager: game.wager,
-    creditsUpdated,
-    whitePlayerId: game.whiteId,
-    blackPlayerId: game.blackId,
-    timestamp: new Date().toISOString(),
-  });
-
-  safeSend(game.whiteWs, payload);
-  safeSend(game.blackWs, payload);
-
-  if (game.whiteWs) {
-    game.whiteWs.gameId = null;
-    game.whiteWs.color = null;
+  // Clean up WS tracking
+  if (whiteWs) {
+    whiteWs.gameId = null;
+    whiteWs.color = null;
   }
-  if (game.blackWs) {
-    game.blackWs.gameId = null;
-    game.blackWs.color = null;
+  if (blackWs) {
+    blackWs.gameId = null;
+    blackWs.color = null;
   }
 
   games.delete(localGameId);
