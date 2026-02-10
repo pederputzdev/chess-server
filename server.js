@@ -474,14 +474,20 @@ async function tryMatchmake(wager) {
     return;
   }
 
-  // 3) Fetch names (optional)
+  // 3) Fetch names (optional) - get_player now returns { player, display_name }
   let aProfile = null;
   let bProfile = null;
   try {
     aProfile = await callGameServer("get_player", withPlayerIdVariants(a.userId));
     bProfile = await callGameServer("get_player", withPlayerIdVariants(b.userId));
-  } catch {
-    // non-fatal
+    console.log("[Server] tryMatchmake: fetched profiles", {
+      aDisplayName: aProfile?.display_name,
+      aPlayerName: aProfile?.player?.name,
+      bDisplayName: bProfile?.display_name,
+      bPlayerName: bProfile?.player?.name,
+    });
+  } catch (e) {
+    console.warn("[Server] tryMatchmake: name fetch failed (non-fatal):", e?.message || e);
   }
 
   // 4) Create in-memory chess state + assign colors
@@ -545,7 +551,7 @@ async function tryMatchmake(wager) {
     serverTimeMs: serverNow,
     opponent: {
       user_id: b.userId,
-      name: bProfile?.name || bProfile?.username || bProfile?.display_name || null,
+      name: bProfile?.display_name || bProfile?.player?.name || null,
     },
   });
 
@@ -571,7 +577,7 @@ async function tryMatchmake(wager) {
     serverTimeMs: serverNow,
     opponent: {
       user_id: a.userId,
-      name: aProfile?.name || aProfile?.username || aProfile?.display_name || null,
+      name: aProfile?.display_name || aProfile?.player?.name || null,
     },
   });
 
