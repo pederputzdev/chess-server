@@ -730,7 +730,16 @@ async function endGame(localGameId, reason, winnerColor = null) {
     blackWs.color = null;
   }
 
-  games.delete(localGameId);
+  // DON'T delete the game immediately — keep it for 60s so a player who
+  // reconnects after alt-tab can still receive the game result.
+  // The reconnect loop checks `game.isEnded` and sends the result.
+  // The clock interval already skips ended games (`if (game.isEnded) continue`).
+  setTimeout(() => {
+    if (games.has(localGameId)) {
+      games.delete(localGameId);
+      console.log("[Server] Cleaned up ended game from map after 60s", { gameId: localGameId });
+    }
+  }, 60_000);
 }
 
 // REMOVED: updateGameState was being called on EVERY move, causing excessive Supabase writes
@@ -1045,90 +1054,114 @@ wss.on("connection", async (ws, req) => {
     ws.inQueue = false;
     ws.wager = null;
 
-    // Check if user has an active game they can reconnect to
+    // Check if user has an active game they can reconnect to,
+    // OR an ended game whose result they missed (e.g. alt-tabbed away).
     let reconnectedGame = null;
     for (const [gameId, game] of games.entries()) {
-      if (game.isEnded) continue;
-      
       // Check if this user is a player in this game
       const isWhite = game.whiteId === userId;
       const isBlack = game.blackId === userId;
       
-      if (isWhite || isBlack) {
-        const playerColor = isWhite ? "w" : "b";
+      if (!isWhite && !isBlack) continue;
+      
+      const playerColor = isWhite ? "w" : "b";
+      
+      // ── CASE A: Game already ended while player was disconnected ──
+      // Send them the game result they missed. This handles alt-tab scenarios
+      // where the WS dropped and game_ended was lost.
+      if (game.isEnded) {
+        console.log("[Server] Player reconnected to ENDED game — sending missed game_ended", {
+          gameId,
+          userId,
+          playerColor,
+          reason: game.lastEndReason,
+          winnerColor: game.lastWinnerColor,
+          timestamp: new Date().toISOString(),
+        });
+        safeSend(ws, {
+          type: "game_ended",
+          reason: game.lastEndReason || "unknown",
+          winnerColor: game.lastWinnerColor || null,
+          gameId,
+          dbGameId: game.supabaseGameId,
+          wager: game.wager || 0,
+          creditsUpdated: true,  // DB was already settled by the time they reconnect
+        });
+        reconnectedGame = game;
+        break;
+      }
+      
+      // ── CASE B: Game is still active — reconnect within grace period ──
+      if (game.disconnectedPlayer === playerColor && game.disconnectedAt) {
+        const timeSinceDisconnect = Date.now() - game.disconnectedAt;
+        const GRACE_PERIOD_MS = 30000;
         
-        // Check if this player was disconnected and is within grace period
-        if (game.disconnectedPlayer === playerColor && game.disconnectedAt) {
-          const timeSinceDisconnect = Date.now() - game.disconnectedAt;
-          const GRACE_PERIOD_MS = 30000;
+        if (timeSinceDisconnect < GRACE_PERIOD_MS) {
+          // Player reconnected within grace period - restore game state
+          console.log("[Server] Player reconnected to existing game", {
+            gameId,
+            userId,
+            playerColor,
+            timeSinceDisconnect,
+            timestamp: new Date().toISOString(),
+          });
           
-          if (timeSinceDisconnect < GRACE_PERIOD_MS) {
-            // Player reconnected within grace period - restore game state
-            console.log("[Server] Player reconnected to existing game", {
-              gameId,
-              userId,
-              playerColor,
-              timeSinceDisconnect,
-              timestamp: new Date().toISOString(),
-            });
-            
-            // Restore WebSocket reference
-            if (playerColor === "w") {
-              game.whiteWs = ws;
-            } else {
-              game.blackWs = ws;
-            }
-            
-            // Clear disconnect state
-            if (game.disconnectTimer) {
-              clearTimeout(game.disconnectTimer);
-              game.disconnectTimer = null;
-            }
-            game.disconnectedAt = null;
-            game.disconnectedPlayer = null;
-            
-            // Set WebSocket game state
-            ws.gameId = gameId;
-            ws.color = playerColor;
-            
-            // Notify opponent that player reconnected
-            const opponentWs = playerColor === "w" ? game.blackWs : game.whiteWs;
-            if (opponentWs && opponentWs.readyState === opponentWs.OPEN) {
-              safeSend(opponentWs, {
-                type: "opponent_reconnected",
-                message: "Opponent reconnected.",
-              });
-            }
-            
-            // Send game sync to reconnected player
-            const clocks = calculateCurrentClocks(game);
-            safeSend(ws, {
-              type: "game_reconnected",
-              message: "Reconnected to your game.",
-              gameId,
-              dbGameId: game.supabaseGameId,
-              fen: game.chess.fen(),
-              turn: clocks.turn,
-              color: playerColor,
-              status: "active",
-              wager: game.wager,
-              // New ms-precision clock snapshot
-              wMs: clocks.wMs,
-              bMs: clocks.bMs,
-              clockRunning: clocks.clockRunning,
-              serverNow: clocks.serverNow,
-              lastMoveAt: clocks.lastMoveAt,
-              whiteId: game.whiteId,
-              blackId: game.blackId,
-              // Legacy seconds fields
-              whiteTime: clocks.whiteTime,
-              blackTime: clocks.blackTime,
-              serverTimeMs: clocks.serverTimeMs,
-            });
-            
-            reconnectedGame = game;
-            break;
+          // Restore WebSocket reference
+          if (playerColor === "w") {
+            game.whiteWs = ws;
+          } else {
+            game.blackWs = ws;
           }
+          
+          // Clear disconnect state
+          if (game.disconnectTimer) {
+            clearTimeout(game.disconnectTimer);
+            game.disconnectTimer = null;
+          }
+          game.disconnectedAt = null;
+          game.disconnectedPlayer = null;
+          
+          // Set WebSocket game state
+          ws.gameId = gameId;
+          ws.color = playerColor;
+          
+          // Notify opponent that player reconnected
+          const opponentWs = playerColor === "w" ? game.blackWs : game.whiteWs;
+          if (opponentWs && opponentWs.readyState === opponentWs.OPEN) {
+            safeSend(opponentWs, {
+              type: "opponent_reconnected",
+              message: "Opponent reconnected.",
+            });
+          }
+          
+          // Send game sync to reconnected player
+          const clocks = calculateCurrentClocks(game);
+          safeSend(ws, {
+            type: "game_reconnected",
+            message: "Reconnected to your game.",
+            gameId,
+            dbGameId: game.supabaseGameId,
+            fen: game.chess.fen(),
+            turn: clocks.turn,
+            color: playerColor,
+            status: "active",
+            wager: game.wager,
+            // New ms-precision clock snapshot
+            wMs: clocks.wMs,
+            bMs: clocks.bMs,
+            clockRunning: clocks.clockRunning,
+            serverNow: clocks.serverNow,
+            lastMoveAt: clocks.lastMoveAt,
+            whiteId: game.whiteId,
+            blackId: game.blackId,
+            // Legacy seconds fields
+            whiteTime: clocks.whiteTime,
+            blackTime: clocks.blackTime,
+            serverTimeMs: clocks.serverTimeMs,
+          });
+          
+          reconnectedGame = game;
+          break;
         }
       }
     }
