@@ -253,6 +253,17 @@ const queues = new Map();
 // games: localId -> { chess, whiteWs, blackWs, supabaseGameId, wager, whiteId, blackId }
 const games = new Map();
 
+// Rolling match history for queue time estimation: [{ wager, timestamp }]
+const matchHistory = [];
+const MATCH_HISTORY_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+
+function pruneMatchHistory() {
+  const cutoff = Date.now() - MATCH_HISTORY_WINDOW_MS;
+  while (matchHistory.length > 0 && matchHistory[0].timestamp < cutoff) {
+    matchHistory.shift();
+  }
+}
+
 // Pending private games waiting for both players to connect via WebSocket
 // supabaseGameId -> { localGameId, supabaseGameId, chess, wager, whiteUserId, blackUserId, whiteName, blackName, whiteWs, blackWs, loading, queuedClients }
 const pendingPrivateGames = new Map();
@@ -524,6 +535,9 @@ async function tryMatchmake(wager) {
     disconnectedPlayer: null,
     disconnectTimer: null,
   });
+
+  // Record match for queue time estimation
+  matchHistory.push({ wager, timestamp: Date.now() });
 
   // Get the game object to access timer state
   const game = games.get(localGameId);
@@ -992,6 +1006,108 @@ const interval = setInterval(() => {
 
 wss.on("close", () => clearInterval(interval));
 
+// --- Queue Time Estimation ---
+
+function formatEstimateLabel(seconds) {
+  if (seconds < 0) return "Estimating...";
+  if (seconds <= 5) return "< 10s";
+  if (seconds <= 15) return "< 30s";
+  if (seconds <= 45) return "< 1 min";
+  if (seconds <= 90) return "~1 min";
+  if (seconds <= 180) return "~2-3 min";
+  if (seconds <= 300) return "~5 min";
+  return "5+ min";
+}
+
+function estimateQueueTime(wager, queuePositionOverride = null) {
+  pruneMatchHistory();
+
+  const onlinePlayers = wss.clients.size;
+  // Count players currently in active games (each game = 2 players)
+  let inGamePlayers = 0;
+  for (const g of games.values()) {
+    if (!g.isEnded) inGamePlayers += 2;
+  }
+
+  const q = queues.get(wager) || [];
+  const queueSize = q.length;
+  const queuePosition = queuePositionOverride !== null ? queuePositionOverride : queueSize;
+
+  // If 2+ in queue, match is imminent (tryMatchmake runs right after enqueue)
+  if (queueSize >= 2) {
+    return {
+      estimatedSeconds: 0,
+      estimatedLabel: "< 10s",
+      queuePosition,
+      queueSize,
+      onlinePlayers,
+      inGamePlayers,
+    };
+  }
+
+  // Count matches for this wager tier in the rolling window
+  const now = Date.now();
+  let matchCount = 0;
+  for (const entry of matchHistory) {
+    if (entry.wager === wager) matchCount++;
+  }
+
+  // Calculate match rate (matches per minute)
+  const windowMinutes = MATCH_HISTORY_WINDOW_MS / 60000;
+  const matchRate = matchCount / windowMinutes;
+
+  let estimatedSeconds;
+
+  if (matchRate > 0) {
+    // Estimate based on historical match rate
+    // Time for one match cycle = 60 / matchRate seconds
+    // Your wait = queuePosition * (60 / matchRate)
+    estimatedSeconds = Math.round((Math.max(queuePosition, 1) / matchRate) * 60);
+  } else {
+    // No historical data — fallback heuristic based on online players
+    // More online players = shorter expected wait
+    if (onlinePlayers <= 1) {
+      estimatedSeconds = -1; // Unknown — no one else online
+    } else if (onlinePlayers <= 5) {
+      estimatedSeconds = 180; // Few players, ~3 min
+    } else if (onlinePlayers <= 15) {
+      estimatedSeconds = 60; // Moderate, ~1 min
+    } else {
+      estimatedSeconds = 30; // Many players, < 30s
+    }
+  }
+
+  // Clamp to reasonable range
+  if (estimatedSeconds > 600) estimatedSeconds = 600;
+
+  return {
+    estimatedSeconds,
+    estimatedLabel: formatEstimateLabel(estimatedSeconds),
+    queuePosition,
+    queueSize,
+    onlinePlayers,
+    inGamePlayers,
+  };
+}
+
+function sendQueueEstimate(ws, wager, queuePosition) {
+  const estimate = estimateQueueTime(wager, queuePosition);
+  safeSend(ws, { type: "queue_estimate", wager, ...estimate });
+}
+
+// Periodic queue estimate broadcast: every 8 seconds, update all queued players
+const QUEUE_ESTIMATE_INTERVAL_MS = 8000;
+const queueEstimateInterval = setInterval(() => {
+  for (const [wager, q] of queues.entries()) {
+    for (let i = 0; i < q.length; i++) {
+      const ws = q[i];
+      if (ws && ws.readyState === ws.OPEN) {
+        sendQueueEstimate(ws, wager, i + 1);
+      }
+    }
+  }
+}, QUEUE_ESTIMATE_INTERVAL_MS);
+
 // --- WS connections ---
 wss.on("connection", async (ws, req) => {
   // Wrap entire connection handler in try/catch to prevent crashes
@@ -1227,6 +1343,9 @@ wss.on("connection", async (ws, req) => {
 
           enqueue(ws, wager);
           safeSend(ws, { type: "searching", message: "Searching for opponent...", wager });
+          // Send initial queue time estimate
+          const q = queues.get(wager) || [];
+          sendQueueEstimate(ws, wager, q.indexOf(ws) + 1);
           tryMatchmake(wager);
           return;
         }
