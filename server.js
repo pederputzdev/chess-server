@@ -870,10 +870,10 @@ function handleMove(ws, data) {
     const elapsed = nowMs - game.lastTurnStartedAt;
     if (previousTurn === 'w') {
       game.whiteTimeMs = Math.max(0, game.whiteTimeMs - elapsed);
-      game.whiteTimeMs += 5000;  // Fischer increment (5s)
+      game.whiteTimeMs += 3000;  // Fischer increment (3s)
     } else {
       game.blackTimeMs = Math.max(0, game.blackTimeMs - elapsed);
-      game.blackTimeMs += 5000;  // Fischer increment (5s)
+      game.blackTimeMs += 3000;  // Fischer increment (3s)
     }
   }
 
