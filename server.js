@@ -1767,15 +1767,25 @@ wss.on("connection", async (ws, req) => {
             return;
           }
           
-          const winnerColor = ws.color === "w" ? "b" : "w";
-          console.log("[Server] RESIGN applied - calling endGame", {
-            gameId: ws.gameId,
-            dbGameId: game.supabaseGameId,
-            resigningPlayerColor: ws.color,
-            winnerColor,
-            reason: "resign",
-          });
-          endGame(ws.gameId, "resign", winnerColor);
+          // If no moves have been made (clock hasn't started), treat as abort — no credits lost
+          if (!game.clockRunning) {
+            console.log("[Server] RESIGN with no moves — aborting game (no credits)", {
+              gameId: ws.gameId,
+              dbGameId: game.supabaseGameId,
+              resigningPlayerColor: ws.color,
+            });
+            endGame(ws.gameId, "abort", null);
+          } else {
+            const winnerColor = ws.color === "w" ? "b" : "w";
+            console.log("[Server] RESIGN applied - calling endGame", {
+              gameId: ws.gameId,
+              dbGameId: game.supabaseGameId,
+              resigningPlayerColor: ws.color,
+              winnerColor,
+              reason: "resign",
+            });
+            endGame(ws.gameId, "resign", winnerColor);
+          }
           return;
         }
 
