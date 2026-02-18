@@ -698,6 +698,15 @@ async function endGame(localGameId, reason, winnerColor = null) {
   // If this fails, the game_ended was already sent — clients can still
   // show the result. Balance sync will retry on the client side.
   let creditsUpdated = false;
+
+  // Extract PGN from the chess instance before cleanup
+  let pgn = null;
+  try {
+    pgn = game.chess.pgn();
+  } catch (e) {
+    console.warn("[Server] Failed to extract PGN", { gameId: localGameId, error: e.message });
+  }
+
   try {
     await callGameServer("end_game", {
       game_id: game.supabaseGameId,
@@ -705,6 +714,7 @@ async function endGame(localGameId, reason, winnerColor = null) {
       // Send variants because edge implementations differ
       ...(winnerId ? withPlayerIdVariants(winnerId) : {}),
       winner_id: winnerId,
+      pgn,
     });
     creditsUpdated = true;
     console.log("[Server] end_game DB update succeeded", {
