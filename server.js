@@ -253,6 +253,59 @@ const queues = new Map();
 // games: localId -> { chess, whiteWs, blackWs, supabaseGameId, wager, whiteId, blackId }
 const games = new Map();
 
+// --- Spectator State ---
+// spectators: localGameId -> Set<WebSocket>
+const spectators = new Map();
+
+function getSpectators(localGameId) {
+  if (!spectators.has(localGameId)) spectators.set(localGameId, new Set());
+  return spectators.get(localGameId);
+}
+
+function broadcastToSpectators(localGameId, obj) {
+  const specs = spectators.get(localGameId);
+  if (!specs || specs.size === 0) return;
+  for (const ws of specs) {
+    safeSend(ws, obj);
+  }
+}
+
+function getSpectatorCount(localGameId) {
+  const specs = spectators.get(localGameId);
+  return specs ? specs.size : 0;
+}
+
+function sendSpectatorCountToPlayers(localGameId) {
+  const game = games.get(localGameId);
+  if (!game) return;
+  const count = getSpectatorCount(localGameId);
+  const payload = { type: "spectator_count_update", count, gameId: localGameId };
+  safeSend(game.whiteWs, payload);
+  safeSend(game.blackWs, payload);
+}
+
+// Find active game by player userId
+function findGameByUserId(userId) {
+  for (const [localGameId, game] of games.entries()) {
+    if (game.isEnded) continue;
+    if (game.whiteId === userId || game.blackId === userId) {
+      return { localGameId, game };
+    }
+  }
+  return null;
+}
+
+function removeSpectator(ws) {
+  if (!ws.spectatingGameId) return;
+  const specs = spectators.get(ws.spectatingGameId);
+  if (specs) {
+    specs.delete(ws);
+    if (specs.size === 0) spectators.delete(ws.spectatingGameId);
+  }
+  sendSpectatorCountToPlayers(ws.spectatingGameId);
+  ws.spectatingGameId = null;
+}
+
 // Rolling match history for queue time estimation: [{ wager, timestamp }]
 const matchHistory = [];
 const MATCH_HISTORY_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
@@ -707,6 +760,7 @@ async function endGame(localGameId, reason, winnerColor = null) {
 
   safeSend(whiteWs, payload);
   safeSend(blackWs, payload);
+  broadcastToSpectators(localGameId, payload);
 
   // ── Now settle credits in the background (DB update) ──
   // If this fails, the game_ended was already sent — clients can still
@@ -767,6 +821,14 @@ async function endGame(localGameId, reason, winnerColor = null) {
   setTimeout(() => {
     if (games.has(localGameId)) {
       games.delete(localGameId);
+      // Clean up spectators for this game
+      const specs = spectators.get(localGameId);
+      if (specs) {
+        for (const specWs of specs) {
+          specWs.spectatingGameId = null;
+        }
+        spectators.delete(localGameId);
+      }
       console.log("[Server] Cleaned up ended game from map after 60s", { gameId: localGameId });
     }
   }, 60_000);
@@ -944,6 +1006,7 @@ function handleMove(ws, data) {
 
   safeSend(game.whiteWs, broadcast);
   safeSend(game.blackWs, broadcast);
+  broadcastToSpectators(localGameId, broadcast);
 
   // Check for game over conditions
   if (chess.isGameOver()) {
@@ -1716,6 +1779,69 @@ wss.on("connection", async (ws, req) => {
           return;
         }
 
+        // ── Spectate: join as spectator ──
+        if (data.type === "spectate_game") {
+          const targetUserId = data.targetUserId;
+          if (!targetUserId) {
+            safeSend(ws, { type: "error", code: "MISSING_TARGET", message: "targetUserId is required." });
+            return;
+          }
+          if (!ws.userId) {
+            safeSend(ws, { type: "error", code: "NOT_AUTHENTICATED", message: "You must be authenticated to spectate." });
+            return;
+          }
+
+          const result = findGameByUserId(targetUserId);
+          if (!result) {
+            safeSend(ws, { type: "error", code: "NO_ACTIVE_GAME", message: "That user is not in an active game." });
+            return;
+          }
+
+          const { localGameId, game } = result;
+
+          // Remove from any previous spectate session
+          if (ws.spectatingGameId) {
+            removeSpectator(ws);
+          }
+
+          // Add to spectators
+          ws.spectatingGameId = localGameId;
+          getSpectators(localGameId).add(ws);
+
+          // Send full game state
+          const clocks = calculateCurrentClocks(game);
+          safeSend(ws, {
+            type: "spectate_started",
+            gameId: localGameId,
+            dbGameId: game.supabaseGameId,
+            fen: game.chess.fen(),
+            turn: clocks.turn,
+            wMs: clocks.wMs,
+            bMs: clocks.bMs,
+            clockRunning: clocks.clockRunning,
+            serverNow: clocks.serverNow,
+            lastMoveAt: clocks.lastMoveAt,
+            whiteId: game.whiteId,
+            blackId: game.blackId,
+            wager: game.wager,
+            isEnded: game.isEnded,
+          });
+
+          // Notify players of new spectator count
+          sendSpectatorCountToPlayers(localGameId);
+          console.log("[Server] Spectator joined", { spectatorUserId: ws.userId, targetUserId, localGameId, count: getSpectatorCount(localGameId) });
+          return;
+        }
+
+        // ── Spectate: leave spectating ──
+        if (data.type === "leave_spectate") {
+          if (ws.spectatingGameId) {
+            console.log("[Server] Spectator left", { spectatorUserId: ws.userId, gameId: ws.spectatingGameId, count: getSpectatorCount(ws.spectatingGameId) - 1 });
+            removeSpectator(ws);
+          }
+          return;
+        }
+
         safeSend(ws, { type: "error", code: "UNKNOWN_TYPE", message: `Unknown type '${data.type}'.` });
       } catch (messageError) {
         // Error handling for individual message type
@@ -1759,6 +1885,11 @@ wss.on("connection", async (ws, req) => {
 
   ws.on("close", () => {
     if (ws.inQueue) removeFromQueue(ws);
+
+    // Clean up spectator state if this ws was spectating
+    if (ws.spectatingGameId) {
+      removeSpectator(ws);
+    }
 
     // Handle disconnect with grace period (30 seconds)
     if (ws.gameId) {
@@ -2037,6 +2168,7 @@ const clockInterval = setInterval(() => {
 
     safeSend(game.whiteWs, snapshot);
     safeSend(game.blackWs, snapshot);
+    broadcastToSpectators(localGameId, snapshot);
   }
 }, CLOCK_TICK_MS);
 
